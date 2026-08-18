@@ -82,6 +82,7 @@ class MarketState(str, Enum):
     BEARISH = "BEARISH"
     RANGING = "RANGING"
     TRANSITION = "TRANSITION"
+    INSUFFICIENT = "INSUFFICIENT"
 
 
 @dataclass(frozen=True)
@@ -298,6 +299,19 @@ def detect_swings(candles: List[Candle], n: int) -> List[SwingPoint]:
 # ============================================================================
 
 def build_structure(swings: List[SwingPoint]) -> List[StructureEvent]:
+    """
+    Compares each swing to the previous swing of the same type.
+
+    An EQUAL price (e.g. price retests the exact prior swing high/low
+    before continuing) is neither a genuine higher/lower high nor a
+    genuine higher/lower low — it's a tie. Forcing a tie into HH/HL/LH/LL
+    via a strict > or < comparison would fabricate a directional signal
+    that didn't actually happen (e.g. a bullish trend pausing at the same
+    resistance level would get mislabeled LH and could falsely flip the
+    state away from BULLISH). Ties are therefore not emitted as a
+    structure event — the last_high/last_low reference still advances,
+    but no HH/HL/LH/LL label is produced for that swing.
+    """
     events: List[StructureEvent] = []
 
     last_high: Optional[SwingPoint] = None
@@ -305,12 +319,12 @@ def build_structure(swings: List[SwingPoint]) -> List[StructureEvent]:
 
     for swing in swings:
         if swing.swing_type == SwingType.HIGH:
-            if last_high is not None:
+            if last_high is not None and swing.price != last_high.price:
                 label = StructureLabel.HH if swing.price > last_high.price else StructureLabel.LH
                 events.append(StructureEvent(swing=swing, label=label))
             last_high = swing
         else:
-            if last_low is not None:
+            if last_low is not None and swing.price != last_low.price:
                 label = StructureLabel.HL if swing.price > last_low.price else StructureLabel.LL
                 events.append(StructureEvent(swing=swing, label=label))
             last_low = swing
@@ -322,13 +336,42 @@ def build_structure(swings: List[SwingPoint]) -> List[StructureEvent]:
 # ============================================================================
 # CORE — STATE CLASSIFICATION
 # ============================================================================
+#
+# Redesigned per Phase 1 classifier correction: RANGING is no longer a
+# default fallback. Every state (BULLISH, BEARISH, TRANSITION, RANGING)
+# must be positively supported by evidence. When evidence is insufficient
+# for any of them, the result is INSUFFICIENT — never RANGING by default.
 
 BULLISH_LABELS = {StructureLabel.HH, StructureLabel.HL}
 BEARISH_LABELS = {StructureLabel.LH, StructureLabel.LL}
-MIN_EVENTS_FOR_DIRECTIONAL_CALL = 3
+
+# How many recent confirmed events are considered as evidence. Wider than
+# the old fixed window so a single counter-swing doesn't consume the
+# entire evaluation window.
+EVIDENCE_WINDOW = 6
+
+# Minimum same-direction events required to call a trend established.
+MIN_TREND_EVIDENCE = 3
+
+# Maximum opposing-direction events tolerated inside an otherwise-valid
+# trend before it stops qualifying as BULLISH/BEARISH outright.
+MAX_TOLERATED_COUNTER = 1
+
+# Minimum pure same-direction events required BEFORE a disruption for
+# that disruption to count as an established trend breaking (TRANSITION).
+MIN_TRANSITION_PRIOR_EVIDENCE = 2
+
+# Minimum events required on EACH side to positively declare genuine
+# two-sided/choppy behavior (RANGING must be evidenced, not assumed).
+MIN_RANGING_EACH_SIDE = 2
+
+# Below this many total confirmed events, there simply isn't enough
+# data to classify anything — INSUFFICIENT, not RANGING.
+MIN_EVENTS_FOR_ANY_CALL = 3
 
 
-def _is_clean_bullish(labels: List[StructureLabel]) -> bool:
+def _is_pure_bullish(labels: List[StructureLabel]) -> bool:
+    """All labels are HH/HL, AND both types are represented."""
     return (
         all(l in BULLISH_LABELS for l in labels)
         and StructureLabel.HH in labels
@@ -336,7 +379,7 @@ def _is_clean_bullish(labels: List[StructureLabel]) -> bool:
     )
 
 
-def _is_clean_bearish(labels: List[StructureLabel]) -> bool:
+def _is_pure_bearish(labels: List[StructureLabel]) -> bool:
     return (
         all(l in BEARISH_LABELS for l in labels)
         and StructureLabel.LH in labels
@@ -344,38 +387,78 @@ def _is_clean_bearish(labels: List[StructureLabel]) -> bool:
     )
 
 
-def classify_state(structure_events: List[StructureEvent], window: int) -> MarketState:
-    if len(structure_events) < MIN_EVENTS_FOR_DIRECTIONAL_CALL:
-        return MarketState.RANGING
+def _find_transition_split(labels: List[StructureLabel]) -> bool:
+    """
+    Searches for a split point where an established pure trend
+    (>= MIN_TRANSITION_PRIOR_EVIDENCE events, both labels of that
+    direction present) is followed by a tail made ENTIRELY of the
+    opposite direction's labels (>= 1 event). Tries splits from the
+    earliest valid point forward, so the largest possible "established"
+    run is checked first. Not restricted to one fixed pattern shape.
+    """
+    n = len(labels)
+    for split in range(MIN_TRANSITION_PRIOR_EVIDENCE, n):
+        prior = labels[:split]
+        tail = labels[split:]
+
+        if not tail:
+            continue
+
+        if _is_pure_bullish(prior) and all(l in BEARISH_LABELS for l in tail):
+            return True
+        if _is_pure_bearish(prior) and all(l in BULLISH_LABELS for l in tail):
+            return True
+
+    return False
+
+
+def classify_state(structure_events: List[StructureEvent], window: int = EVIDENCE_WINDOW) -> MarketState:
+    # Step 1 — raw data scarcity check.
+    if len(structure_events) < MIN_EVENTS_FOR_ANY_CALL:
+        return MarketState.INSUFFICIENT
 
     recent = structure_events[-window:] if len(structure_events) >= window else structure_events
     labels = [e.label for e in recent]
 
-    if _is_clean_bullish(labels):
+    bull_count = sum(1 for l in labels if l in BULLISH_LABELS)
+    bear_count = sum(1 for l in labels if l in BEARISH_LABELS)
+    has_both_bull_labels = StructureLabel.HH in labels and StructureLabel.HL in labels
+    has_both_bear_labels = StructureLabel.LH in labels and StructureLabel.LL in labels
+    last_label = labels[-1]
+
+    # Step 2 — BULLISH: sufficient evidence, tolerable counter-evidence,
+    # and the most recent event still belongs to the bullish direction
+    # (i.e. the trend is currently intact, not actively breaking now).
+    if (
+        has_both_bull_labels
+        and bull_count >= MIN_TREND_EVIDENCE
+        and bear_count <= MAX_TOLERATED_COUNTER
+        and last_label in BULLISH_LABELS
+    ):
         return MarketState.BULLISH
-    if _is_clean_bearish(labels):
+
+    # Step 3 — BEARISH: mirror of step 2.
+    if (
+        has_both_bear_labels
+        and bear_count >= MIN_TREND_EVIDENCE
+        and bull_count <= MAX_TOLERATED_COUNTER
+        and last_label in BEARISH_LABELS
+    ):
         return MarketState.BEARISH
 
-    if len(labels) >= 3:
-        prior, tail = labels[:-1], labels[-1]
+    # Step 4 — TRANSITION: established trend followed by an opposite-
+    # direction tail, at any valid split point (not one fixed pattern).
+    if _find_transition_split(labels):
+        return MarketState.TRANSITION
 
-        prior_was_bullish = (
-            all(l in BULLISH_LABELS for l in prior)
-            and StructureLabel.HH in prior
-            and StructureLabel.HL in prior
-        )
-        prior_was_bearish = (
-            all(l in BEARISH_LABELS for l in prior)
-            and StructureLabel.LH in prior
-            and StructureLabel.LL in prior
-        )
+    # Step 5 — RANGING: requires POSITIVE evidence of two-sided behavior,
+    # i.e. real representation on both sides, not just "didn't qualify above".
+    if min(bull_count, bear_count) >= MIN_RANGING_EACH_SIDE:
+        return MarketState.RANGING
 
-        if prior_was_bullish and tail in BEARISH_LABELS:
-            return MarketState.TRANSITION
-        if prior_was_bearish and tail in BULLISH_LABELS:
-            return MarketState.TRANSITION
-
-    return MarketState.RANGING
+    # Step 6 — genuine fallthrough: not enough evidence for any positive
+    # call. This replaces the old RANGING-by-default behavior.
+    return MarketState.INSUFFICIENT
 
 
 # ============================================================================
