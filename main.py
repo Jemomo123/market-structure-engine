@@ -1,12 +1,24 @@
 """
 Market State Detector — Phase 1 (single-file build)
+
+Everything lives in this one file on purpose — it removes any risk of
+folder/import mistakes when deploying from a phone.
+
 Pipeline: OHLCV -> Swing Detection -> Market Structure -> Market State -> Report
+
+Run:
+    pip install -r requirements.txt
+    python main.py
 """
 
 import logging
+import os
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import List, Optional
 
 import ccxt
@@ -14,19 +26,44 @@ import ccxt
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("market_state_detector")
 
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+
 WATCHLIST = [
     "BTC", "ETH", "SOL", "BNB", "XRP",
     "DOGE", "SHIB", "AVAX", "LINK", "SUI",
 ]
 
 TIMEFRAMES = ["5m", "15m", "1h"]
+
 EXCHANGE_PRIORITY = ["OKX", "MEXC"]
 QUOTE_CURRENCY = "USDT"
 CANDLE_FETCH_LIMIT = 300
 MIN_VALID_CANDLES = 100
+
 SWING_N = 2
 STRUCTURE_WINDOW = 4
 
+# How often to rerun the full detection pass, in seconds. 5m is the
+# shortest tracked timeframe, so refreshing much faster than that gains
+# little and risks exchange rate limits.
+REFRESH_INTERVAL_SECONDS = int(os.environ.get("REFRESH_INTERVAL_SECONDS", 300))
+
+# Render (and similar platforms) expect a Web Service to have something
+# listening on a port, or the deploy is eventually flagged unhealthy even
+# though the detection loop itself is running fine.
+PORT = int(os.environ.get("PORT", 10000))
+
+# Holds the most recent report text so the health server can serve it.
+_latest_report_lock = threading.Lock()
+_latest_report_text = "No report generated yet."
+
+
+# ============================================================================
+# MODELS
+# ============================================================================
 
 class SwingType(str, Enum):
     HIGH = "HIGH"
@@ -93,6 +130,10 @@ class MarketStateResult:
     error: Optional[str] = None
 
 
+# ============================================================================
+# DATA PROVIDERS
+# ============================================================================
+
 class ProviderError(Exception):
     pass
 
@@ -124,8 +165,10 @@ class OKXProvider(BaseProvider):
             raw = self._client.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except Exception as exc:
             raise ProviderError(f"OKX fetch failed for {symbol} {timeframe}: {exc}") from exc
+
         if not raw:
             raise ProviderError(f"OKX returned empty OHLCV for {symbol} {timeframe}")
+
         return [
             Candle(timestamp=row[0], open=row[1], high=row[2], low=row[3], close=row[4], volume=row[5])
             for row in raw
@@ -150,8 +193,10 @@ class MEXCProvider(BaseProvider):
             raw = self._client.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except Exception as exc:
             raise ProviderError(f"MEXC fetch failed for {symbol} {timeframe}: {exc}") from exc
+
         if not raw:
             raise ProviderError(f"MEXC returned empty OHLCV for {symbol} {timeframe}")
+
         return [
             Candle(timestamp=row[0], open=row[1], high=row[2], low=row[3], close=row[4], volume=row[5])
             for row in raw
@@ -163,9 +208,11 @@ def _validate_candles(candles: List[Candle]) -> bool:
         return False
     if len(candles) < MIN_VALID_CANDLES:
         return False
+
     timestamps = [c.timestamp for c in candles]
     if any(timestamps[i] >= timestamps[i + 1] for i in range(len(timestamps) - 1)):
         return False
+
     for c in candles:
         if any(v is None for v in (c.open, c.high, c.low, c.close, c.volume)):
             return False
@@ -175,6 +222,7 @@ def _validate_candles(candles: List[Candle]) -> bool:
             return False
         if c.volume < 0:
             return False
+
     return True
 
 
@@ -184,6 +232,7 @@ class DataRouter:
 
     def get_ohlcv(self, base_asset: str, timeframe: str) -> OHLCVResult:
         errors = []
+
         for i, provider in enumerate(self._providers):
             is_fallback = i > 0
             try:
@@ -192,42 +241,68 @@ class DataRouter:
                 logger.warning(str(exc))
                 errors.append(f"{provider.name}: {exc}")
                 continue
+
             if not _validate_candles(candles):
                 msg = f"{provider.name} returned invalid/insufficient OHLCV for {base_asset} {timeframe}"
                 logger.warning(msg)
                 errors.append(msg)
                 continue
+
             return OHLCVResult(
-                symbol=base_asset, timeframe=timeframe, candles=candles,
-                source=provider.name, is_fallback=is_fallback, error=None,
+                symbol=base_asset,
+                timeframe=timeframe,
+                candles=candles,
+                source=provider.name,
+                is_fallback=is_fallback,
+                error=None,
             )
+
         return OHLCVResult(
-            symbol=base_asset, timeframe=timeframe, candles=[], source=None,
-            is_fallback=False, error="; ".join(errors) if errors else "No providers available",
+            symbol=base_asset,
+            timeframe=timeframe,
+            candles=[],
+            source=None,
+            is_fallback=False,
+            error="; ".join(errors) if errors else "No providers available",
         )
 
 
+# ============================================================================
+# CORE — SWING DETECTION
+# ============================================================================
+
 def detect_swings(candles: List[Candle], n: int) -> List[SwingPoint]:
     swings: List[SwingPoint] = []
+
     if len(candles) < (2 * n + 1):
         return swings
+
     for i in range(n, len(candles) - n):
         window = candles[i - n:i + n + 1]
         pivot = candles[i]
+
         is_swing_high = all(pivot.high > c.high for c in window if c is not pivot)
         if is_swing_high:
             swings.append(SwingPoint(index=i, timestamp=pivot.timestamp, price=pivot.high, swing_type=SwingType.HIGH))
             continue
+
         is_swing_low = all(pivot.low < c.low for c in window if c is not pivot)
         if is_swing_low:
             swings.append(SwingPoint(index=i, timestamp=pivot.timestamp, price=pivot.low, swing_type=SwingType.LOW))
+
     return swings
 
 
+# ============================================================================
+# CORE — MARKET STRUCTURE
+# ============================================================================
+
 def build_structure(swings: List[SwingPoint]) -> List[StructureEvent]:
     events: List[StructureEvent] = []
+
     last_high: Optional[SwingPoint] = None
     last_low: Optional[SwingPoint] = None
+
     for swing in swings:
         if swing.swing_type == SwingType.HIGH:
             if last_high is not None:
@@ -239,9 +314,14 @@ def build_structure(swings: List[SwingPoint]) -> List[StructureEvent]:
                 label = StructureLabel.HL if swing.price > last_low.price else StructureLabel.LL
                 events.append(StructureEvent(swing=swing, label=label))
             last_low = swing
+
     events.sort(key=lambda e: e.swing.index)
     return events
 
+
+# ============================================================================
+# CORE — STATE CLASSIFICATION
+# ============================================================================
 
 BULLISH_LABELS = {StructureLabel.HH, StructureLabel.HL}
 BEARISH_LABELS = {StructureLabel.LH, StructureLabel.LL}
@@ -249,32 +329,58 @@ MIN_EVENTS_FOR_DIRECTIONAL_CALL = 3
 
 
 def _is_clean_bullish(labels: List[StructureLabel]) -> bool:
-    return all(l in BULLISH_LABELS for l in labels) and StructureLabel.HH in labels and StructureLabel.HL in labels
+    return (
+        all(l in BULLISH_LABELS for l in labels)
+        and StructureLabel.HH in labels
+        and StructureLabel.HL in labels
+    )
 
 
 def _is_clean_bearish(labels: List[StructureLabel]) -> bool:
-    return all(l in BEARISH_LABELS for l in labels) and StructureLabel.LH in labels and StructureLabel.LL in labels
+    return (
+        all(l in BEARISH_LABELS for l in labels)
+        and StructureLabel.LH in labels
+        and StructureLabel.LL in labels
+    )
 
 
 def classify_state(structure_events: List[StructureEvent], window: int) -> MarketState:
     if len(structure_events) < MIN_EVENTS_FOR_DIRECTIONAL_CALL:
         return MarketState.RANGING
+
     recent = structure_events[-window:] if len(structure_events) >= window else structure_events
     labels = [e.label for e in recent]
+
     if _is_clean_bullish(labels):
         return MarketState.BULLISH
     if _is_clean_bearish(labels):
         return MarketState.BEARISH
+
     if len(labels) >= 3:
         prior, tail = labels[:-1], labels[-1]
-        prior_was_bullish = all(l in BULLISH_LABELS for l in prior) and StructureLabel.HH in prior and StructureLabel.HL in prior
-        prior_was_bearish = all(l in BEARISH_LABELS for l in prior) and StructureLabel.LH in prior and StructureLabel.LL in prior
+
+        prior_was_bullish = (
+            all(l in BULLISH_LABELS for l in prior)
+            and StructureLabel.HH in prior
+            and StructureLabel.HL in prior
+        )
+        prior_was_bearish = (
+            all(l in BEARISH_LABELS for l in prior)
+            and StructureLabel.LH in prior
+            and StructureLabel.LL in prior
+        )
+
         if prior_was_bullish and tail in BEARISH_LABELS:
             return MarketState.TRANSITION
         if prior_was_bearish and tail in BULLISH_LABELS:
             return MarketState.TRANSITION
+
     return MarketState.RANGING
 
+
+# ============================================================================
+# OUTPUT
+# ============================================================================
 
 def format_source(result: MarketStateResult) -> str:
     if result.error:
@@ -290,44 +396,138 @@ def format_state(result: MarketStateResult) -> str:
     return result.state.value
 
 
-def print_report(results: List[MarketStateResult]) -> None:
+def build_report_text(results: List[MarketStateResult]) -> str:
     header = f"{'COIN':<6} {'TF':<5} {'STATE':<12} {'SOURCE':<18} {'STRUCTURE (recent -> latest)'}"
-    print(header)
-    print("-" * len(header))
+    lines = [header, "-" * len(header)]
+
     for r in results:
-        structure_str = " -> ".join(l.value for l in r.recent_structure) if r.recent_structure else "(insufficient swings)"
+        structure_str = (
+            " -> ".join(l.value for l in r.recent_structure)
+            if r.recent_structure else "(insufficient swings)"
+        )
         if r.error:
-            print(f"{r.symbol:<6} {r.timeframe:<5} {'NO DATA':<12} {'-':<18} {r.error}")
+            lines.append(f"{r.symbol:<6} {r.timeframe:<5} {'NO DATA':<12} {'-':<18} {r.error}")
             continue
-        print(f"{r.symbol:<6} {r.timeframe:<5} {format_state(r):<12} {format_source(r):<18} {structure_str}")
+
+        lines.append(
+            f"{r.symbol:<6} {r.timeframe:<5} {format_state(r):<12} "
+            f"{format_source(r):<18} {structure_str}"
+        )
+
+    return "\n".join(lines)
 
 
-def run() -> None:
-    router = DataRouter()
+def print_report(results: List[MarketStateResult]) -> None:
+    print(build_report_text(results))
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def run_once(router: DataRouter) -> List[MarketStateResult]:
+    """Runs a single full detection pass over the whole watchlist and
+    returns the results. Pure — does no printing or I/O of its own."""
     results = []
+
     for symbol in WATCHLIST:
         for timeframe in TIMEFRAMES:
             ohlcv = router.get_ohlcv(symbol, timeframe)
+
             if ohlcv.error:
                 results.append(MarketStateResult(
-                    symbol=symbol, timeframe=timeframe, state=None, source=None,
-                    is_fallback=False, recent_structure=[], swing_count=0, error=ohlcv.error,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    state=None,
+                    source=None,
+                    is_fallback=False,
+                    recent_structure=[],
+                    swing_count=0,
+                    error=ohlcv.error,
                 ))
                 continue
+
             swings = detect_swings(ohlcv.candles, n=SWING_N)
             structure_events = build_structure(swings)
             state = classify_state(structure_events, window=STRUCTURE_WINDOW)
+
             recent_labels = [
                 e.label for e in
-                (structure_events[-STRUCTURE_WINDOW:] if len(structure_events) >= STRUCTURE_WINDOW else structure_events)
+                (structure_events[-STRUCTURE_WINDOW:] if len(structure_events) >= STRUCTURE_WINDOW
+                 else structure_events)
             ]
+
             results.append(MarketStateResult(
-                symbol=symbol, timeframe=timeframe, state=state, source=ohlcv.source,
-                is_fallback=ohlcv.is_fallback, recent_structure=recent_labels,
-                swing_count=len(swings), error=None,
+                symbol=symbol,
+                timeframe=timeframe,
+                state=state,
+                source=ohlcv.source,
+                is_fallback=ohlcv.is_fallback,
+                recent_structure=recent_labels,
+                swing_count=len(swings),
+                error=None,
             ))
-    print_report(results)
+
+    return results
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP server so the platform sees something listening on
+    PORT. GET / (or anything) returns the most recent report as plain
+    text. This has nothing to do with the detection logic itself."""
+
+    def do_GET(self):  # noqa: N802 (stdlib method name)
+        with _latest_report_lock:
+            body = _latest_report_text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):  # noqa: A002
+        # Silence default request logging; the detection loop's own
+        # logging is what matters here.
+        pass
+
+
+def _start_health_server() -> None:
+    server = HTTPServer(("0.0.0.0", PORT), _HealthHandler)
+    logger.info(f"Health/report server listening on port {PORT}")
+    server.serve_forever()
+
+
+def run_forever() -> None:
+    global _latest_report_text
+
+    router = DataRouter()
+
+    # The HTTP server runs in a background thread so it can respond to
+    # health checks / report requests at any time, independent of where
+    # the detection loop currently is in its cycle.
+    health_thread = threading.Thread(target=_start_health_server, daemon=True)
+    health_thread.start()
+
+    while True:
+        started_at = time.time()
+        logger.info("Starting detection pass...")
+
+        try:
+            results = run_once(router)
+            report_text = build_report_text(results)
+            with _latest_report_lock:
+                _latest_report_text = report_text
+            print(report_text)
+        except Exception:
+            # A single bad pass should never kill the whole service —
+            # log it and try again next cycle rather than crashing.
+            logger.exception("Detection pass failed; will retry next cycle.")
+
+        elapsed = time.time() - started_at
+        sleep_for = max(0.0, REFRESH_INTERVAL_SECONDS - elapsed)
+        logger.info(f"Pass complete in {elapsed:.1f}s. Sleeping {sleep_for:.1f}s.")
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
-    run()
+    run_forever()
