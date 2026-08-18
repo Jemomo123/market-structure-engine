@@ -16,7 +16,7 @@ logger = logging.getLogger("market_state_detector")
 
 WATCHLIST = [
     "BTC", "ETH", "SOL", "BNB", "XRP",
-    "DOGE", "TON", "AVAX", "LINK", "SUI",
+    "DOGE", "SHIB", "AVAX", "LINK", "SUI",
 ]
 
 TIMEFRAMES = ["5m", "15m", "1h"]
