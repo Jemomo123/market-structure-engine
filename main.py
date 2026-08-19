@@ -364,6 +364,13 @@ MIN_TRANSITION_PRIOR_EVIDENCE = 2
 # two-sided/choppy behavior (RANGING must be evidenced, not assumed).
 MIN_RANGING_EACH_SIDE = 2
 
+# Maximum allowed difference between bull_count and bear_count for a
+# window to qualify as genuinely balanced/two-sided RANGING. A skewed
+# split (e.g. 4-2) is directional evidence that fell short of the
+# BULLISH/BEARISH threshold, not genuine chop, and must NOT be labeled
+# RANGING just because both sides cleared MIN_RANGING_EACH_SIDE.
+MAX_RANGING_IMBALANCE = 1
+
 # Below this many total confirmed events, there simply isn't enough
 # data to classify anything — INSUFFICIENT, not RANGING.
 MIN_EVENTS_FOR_ANY_CALL = 3
@@ -451,8 +458,14 @@ def classify_state(structure_events: List[StructureEvent], window: int = EVIDENC
         return MarketState.TRANSITION
 
     # Step 5 — RANGING: requires POSITIVE evidence of two-sided behavior,
-    # i.e. real representation on both sides, not just "didn't qualify above".
-    if min(bull_count, bear_count) >= MIN_RANGING_EACH_SIDE:
+    # i.e. real representation on both sides, not just "didn't qualify
+    # above". Also requires the two sides to be roughly balanced —
+    # a skewed split (e.g. 4 bear vs 2 bull) is directional evidence
+    # that fell short of BULLISH/BEARISH, not genuine two-sided chop.
+    if (
+        min(bull_count, bear_count) >= MIN_RANGING_EACH_SIDE
+        and abs(bull_count - bear_count) <= MAX_RANGING_IMBALANCE
+    ):
         return MarketState.RANGING
 
     # Step 6 — genuine fallthrough: not enough evidence for any positive
