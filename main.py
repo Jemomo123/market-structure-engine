@@ -44,7 +44,6 @@ CANDLE_FETCH_LIMIT = 300
 MIN_VALID_CANDLES = 100
 
 SWING_N = 2
-STRUCTURE_WINDOW = 4
 
 # How often to rerun the full detection pass, in seconds. 5m is the
 # shortest tracked timeframe, so refreshing much faster than that gains
@@ -532,11 +531,11 @@ def run_once(router: DataRouter) -> List[MarketStateResult]:
 
             swings = detect_swings(ohlcv.candles, n=SWING_N)
             structure_events = build_structure(swings)
-            state = classify_state(structure_events, window=STRUCTURE_WINDOW)
+            state = classify_state(structure_events, window=EVIDENCE_WINDOW)
 
             recent_labels = [
                 e.label for e in
-                (structure_events[-STRUCTURE_WINDOW:] if len(structure_events) >= STRUCTURE_WINDOW
+                (structure_events[-EVIDENCE_WINDOW:] if len(structure_events) >= EVIDENCE_WINDOW
                  else structure_events)
             ]
 
