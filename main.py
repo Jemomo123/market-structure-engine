@@ -45,6 +45,14 @@ MIN_VALID_CANDLES = 100
 
 SWING_N = 2
 
+# Timeframe -> duration in milliseconds. Used to determine whether the
+# most recent fetched candle has actually closed yet.
+TIMEFRAME_MS = {
+    "5m": 5 * 60 * 1000,
+    "15m": 15 * 60 * 1000,
+    "1h": 60 * 60 * 1000,
+}
+
 # How often to rerun the full detection pass, in seconds. 5m is the
 # shortest tracked timeframe, so refreshing much faster than that gains
 # little and risks exchange rate limits.
@@ -102,6 +110,11 @@ class OHLCVResult:
     source: Optional[str]
     is_fallback: bool = False
     error: Optional[str] = None
+    # Candle-cleaning pipeline diagnostics
+    raw_candle_count: int = 0
+    duplicates_removed: int = 0
+    forming_candle_removed: bool = False
+    closed_candle_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -128,6 +141,15 @@ class MarketStateResult:
     recent_structure: List[StructureLabel]
     swing_count: int
     error: Optional[str] = None
+    # Pipeline / classification diagnostics
+    raw_candle_count: int = 0
+    duplicates_removed: int = 0
+    forming_candle_removed: bool = False
+    closed_candle_count: int = 0
+    swing_high_count: int = 0
+    swing_low_count: int = 0
+    structure_event_count: int = 0
+    classification_reason: str = ""
 
 
 # ============================================================================
@@ -203,6 +225,74 @@ class MEXCProvider(BaseProvider):
         ]
 
 
+def normalize_and_clean_candles(raw_candles: List[Candle], timeframe: str):
+    """
+    fetch -> NORMALIZE -> SORT -> DEDUPLICATE -> REMOVE FORMING CANDLE
+
+    Returns (cleaned_candles, diagnostics_dict). Validation of the cleaned
+    result happens separately in _validate_candles, so this function's job
+    is strictly cleaning/normalization, not accept/reject decisions.
+    """
+    diag = {
+        "raw_candle_count": len(raw_candles),
+        "duplicates_removed": 0,
+        "forming_candle_removed": False,
+        "closed_candle_count": 0,
+    }
+
+    if not raw_candles:
+        return [], diag
+
+    # NORMALIZE: coerce timestamp to int ms, OHLCV values to float. This
+    # also naturally surfaces malformed rows (raises) rather than silently
+    # passing bad types downstream.
+    normalized = [
+        Candle(
+            timestamp=int(c.timestamp),
+            open=float(c.open),
+            high=float(c.high),
+            low=float(c.low),
+            close=float(c.close),
+            volume=float(c.volume),
+        )
+        for c in raw_candles
+    ]
+
+    # SORT CHRONOLOGICALLY: exchanges are expected to return ascending
+    # order already, but this must not be assumed.
+    normalized.sort(key=lambda c: c.timestamp)
+
+    # DEDUPLICATE: deterministic — keep the first occurrence of each
+    # timestamp after sorting, drop any repeats.
+    seen_timestamps = set()
+    deduped: List[Candle] = []
+    for c in normalized:
+        if c.timestamp in seen_timestamps:
+            continue
+        seen_timestamps.add(c.timestamp)
+        deduped.append(c)
+    diag["duplicates_removed"] = len(normalized) - len(deduped)
+
+    # REMOVE CURRENTLY FORMING CANDLE: a candle is still forming if its
+    # close time (open time + timeframe duration) is in the future
+    # relative to now (UTC). Only remove it when it is ACTUALLY still
+    # forming — never blindly drop the last row.
+    forming_removed = False
+    if deduped:
+        tf_ms = TIMEFRAME_MS.get(timeframe)
+        if tf_ms is not None:
+            now_ms = int(time.time() * 1000)
+            last_candle = deduped[-1]
+            candle_close_time_ms = last_candle.timestamp + tf_ms
+            if candle_close_time_ms > now_ms:
+                deduped = deduped[:-1]
+                forming_removed = True
+    diag["forming_candle_removed"] = forming_removed
+    diag["closed_candle_count"] = len(deduped)
+
+    return deduped, diag
+
+
 def _validate_candles(candles: List[Candle]) -> bool:
     if not candles:
         return False
@@ -236,14 +326,24 @@ class DataRouter:
         for i, provider in enumerate(self._providers):
             is_fallback = i > 0
             try:
-                candles = provider.fetch_ohlcv(base_asset, timeframe, CANDLE_FETCH_LIMIT)
+                raw_candles = provider.fetch_ohlcv(base_asset, timeframe, CANDLE_FETCH_LIMIT)
             except ProviderError as exc:
                 logger.warning(str(exc))
                 errors.append(f"{provider.name}: {exc}")
                 continue
 
-            if not _validate_candles(candles):
-                msg = f"{provider.name} returned invalid/insufficient OHLCV for {base_asset} {timeframe}"
+            # fetch -> NORMALIZE -> SORT -> DEDUPLICATE -> REMOVE FORMING CANDLE
+            cleaned_candles, clean_diag = normalize_and_clean_candles(raw_candles, timeframe)
+
+            # VALIDATE the cleaned (closed-only) series, not the raw fetch.
+            if not _validate_candles(cleaned_candles):
+                msg = (
+                    f"{provider.name} returned invalid/insufficient OHLCV for {base_asset} {timeframe} "
+                    f"(raw={clean_diag['raw_candle_count']}, "
+                    f"dupes_removed={clean_diag['duplicates_removed']}, "
+                    f"forming_removed={clean_diag['forming_candle_removed']}, "
+                    f"closed={clean_diag['closed_candle_count']})"
+                )
                 logger.warning(msg)
                 errors.append(msg)
                 continue
@@ -251,10 +351,14 @@ class DataRouter:
             return OHLCVResult(
                 symbol=base_asset,
                 timeframe=timeframe,
-                candles=candles,
+                candles=cleaned_candles,
                 source=provider.name,
                 is_fallback=is_fallback,
                 error=None,
+                raw_candle_count=clean_diag["raw_candle_count"],
+                duplicates_removed=clean_diag["duplicates_removed"],
+                forming_candle_removed=clean_diag["forming_candle_removed"],
+                closed_candle_count=clean_diag["closed_candle_count"],
             )
 
         return OHLCVResult(
@@ -393,7 +497,7 @@ def _is_pure_bearish(labels: List[StructureLabel]) -> bool:
     )
 
 
-def _find_transition_split(labels: List[StructureLabel]) -> bool:
+def _find_transition_split(labels: List[StructureLabel]) -> Optional[str]:
     """
     Searches for a split point where an established pure trend
     (>= MIN_TRANSITION_PRIOR_EVIDENCE events, both labels of that
@@ -401,6 +505,9 @@ def _find_transition_split(labels: List[StructureLabel]) -> bool:
     opposite direction's labels (>= 1 event). Tries splits from the
     earliest valid point forward, so the largest possible "established"
     run is checked first. Not restricted to one fixed pattern shape.
+
+    Returns "bullish" or "bearish" (the direction that was established
+    and then broke) or None if no such split exists.
     """
     n = len(labels)
     for split in range(MIN_TRANSITION_PRIOR_EVIDENCE, n):
@@ -411,17 +518,36 @@ def _find_transition_split(labels: List[StructureLabel]) -> bool:
             continue
 
         if _is_pure_bullish(prior) and all(l in BEARISH_LABELS for l in tail):
-            return True
+            return "bullish"
         if _is_pure_bearish(prior) and all(l in BULLISH_LABELS for l in tail):
-            return True
+            return "bearish"
 
-    return False
+    return None
 
 
-def classify_state(structure_events: List[StructureEvent], window: int = EVIDENCE_WINDOW) -> MarketState:
-    # Step 1 — raw data scarcity check.
+def classify_state_detailed(
+    structure_events: List[StructureEvent], window: int = EVIDENCE_WINDOW
+):
+    """
+    Returns (MarketState, reason_string).
+
+    Correction applied: INSUFFICIENT is reserved EXCLUSIVELY for genuine
+    data scarcity (Step 1). Once there is enough confirmed structure to
+    evaluate (>= MIN_EVENTS_FOR_ANY_CALL), the classifier ALWAYS resolves
+    to a positive state — BULLISH, BEARISH, TRANSITION, or RANGING.
+    RANGING is not a "nothing else matched" dump: it is evidence-based,
+    with the reason string distinguishing genuinely balanced two-sided
+    structure from abundant-but-indeterminate structure, but both cases
+    are legitimately RANGING (real confirmed data, no clean directional
+    or transition signal) rather than a data-quality problem.
+    """
+    # Step 1 — the ONLY path to INSUFFICIENT: genuine data scarcity.
     if len(structure_events) < MIN_EVENTS_FOR_ANY_CALL:
-        return MarketState.INSUFFICIENT
+        return (
+            MarketState.INSUFFICIENT,
+            f"only {len(structure_events)} confirmed structure event(s); "
+            f"need at least {MIN_EVENTS_FOR_ANY_CALL} to classify",
+        )
 
     recent = structure_events[-window:] if len(structure_events) >= window else structure_events
     labels = [e.label for e in recent]
@@ -441,7 +567,11 @@ def classify_state(structure_events: List[StructureEvent], window: int = EVIDENC
         and bear_count <= MAX_TOLERATED_COUNTER
         and last_label in BULLISH_LABELS
     ):
-        return MarketState.BULLISH
+        return (
+            MarketState.BULLISH,
+            f"established bullish structure (HH/HL evidence={bull_count}, "
+            f"counter-evidence={bear_count}, last event={last_label.value})",
+        )
 
     # Step 3 — BEARISH: mirror of step 2.
     if (
@@ -450,27 +580,50 @@ def classify_state(structure_events: List[StructureEvent], window: int = EVIDENC
         and bull_count <= MAX_TOLERATED_COUNTER
         and last_label in BEARISH_LABELS
     ):
-        return MarketState.BEARISH
+        return (
+            MarketState.BEARISH,
+            f"established bearish structure (LH/LL evidence={bear_count}, "
+            f"counter-evidence={bull_count}, last event={last_label.value})",
+        )
 
     # Step 4 — TRANSITION: established trend followed by an opposite-
     # direction tail, at any valid split point (not one fixed pattern).
-    if _find_transition_split(labels):
-        return MarketState.TRANSITION
+    broken_direction = _find_transition_split(labels)
+    if broken_direction is not None:
+        return (
+            MarketState.TRANSITION,
+            f"established {broken_direction} trend broken by a meaningful "
+            f"opposite-direction tail",
+        )
 
-    # Step 5 — RANGING: requires POSITIVE evidence of two-sided behavior,
-    # i.e. real representation on both sides, not just "didn't qualify
-    # above". Also requires the two sides to be roughly balanced —
-    # a skewed split (e.g. 4 bear vs 2 bull) is directional evidence
-    # that fell short of BULLISH/BEARISH, not genuine two-sided chop.
+    # Step 5 — RANGING: the evidence-based catch-all for every remaining
+    # case that reaches this point. By construction, len(structure_events)
+    # >= MIN_EVENTS_FOR_ANY_CALL is already guaranteed (Step 1 passed), so
+    # this is NEVER a data-scarcity situation — it is abundant confirmed
+    # structure that simply does not show a clean directional or
+    # transition pattern. That is what RANGING means; it must not be
+    # reported as INSUFFICIENT just because it failed the narrow
+    # BULLISH/BEARISH/TRANSITION rules above.
     if (
         min(bull_count, bear_count) >= MIN_RANGING_EACH_SIDE
         and abs(bull_count - bear_count) <= MAX_RANGING_IMBALANCE
     ):
-        return MarketState.RANGING
+        return (
+            MarketState.RANGING,
+            f"genuine balanced two-sided structure (bull={bull_count}, bear={bear_count})",
+        )
 
-    # Step 6 — genuine fallthrough: not enough evidence for any positive
-    # call. This replaces the old RANGING-by-default behavior.
-    return MarketState.INSUFFICIENT
+    return (
+        MarketState.RANGING,
+        f"mixed/indeterminate structure with sufficient confirmed evidence "
+        f"(bull={bull_count}, bear={bear_count}); no clean directional or "
+        f"transition pattern met",
+    )
+
+
+def classify_state(structure_events: List[StructureEvent], window: int = EVIDENCE_WINDOW) -> MarketState:
+    state, _reason = classify_state_detailed(structure_events, window)
+    return state
 
 
 # ============================================================================
@@ -509,6 +662,39 @@ def build_report_text(results: List[MarketStateResult]) -> str:
             f"{format_source(r):<18} {structure_str}"
         )
 
+    lines.append("")
+    lines.append(build_diagnostics_text(results))
+
+    return "\n".join(lines)
+
+
+def build_diagnostics_text(results: List[MarketStateResult]) -> str:
+    """
+    Per-row pipeline/classification diagnostics, as required:
+    provider, raw candles, duplicates removed, forming candle detected/
+    removed, closed candle count, swing high/low counts, total swings,
+    structure-event count, final state, and the classification reason.
+    """
+    header = (
+        f"{'COIN':<6} {'TF':<5} {'PROV':<6} {'RAW':<5} {'DUPES':<6} "
+        f"{'FORMING':<8} {'CLOSED':<7} {'SWH':<4} {'SWL':<4} {'SWINGS':<7} "
+        f"{'EVENTS':<7} {'STATE':<12} REASON"
+    )
+    lines = ["DIAGNOSTICS", header, "-" * len(header)]
+
+    for r in results:
+        if r.error:
+            lines.append(f"{r.symbol:<6} {r.timeframe:<5} NO DATA — {r.error}")
+            continue
+
+        lines.append(
+            f"{r.symbol:<6} {r.timeframe:<5} {(r.source or '-'):<6} "
+            f"{r.raw_candle_count:<5} {r.duplicates_removed:<6} "
+            f"{str(r.forming_candle_removed):<8} {r.closed_candle_count:<7} "
+            f"{r.swing_high_count:<4} {r.swing_low_count:<4} {r.swing_count:<7} "
+            f"{r.structure_event_count:<7} {format_state(r):<12} {r.classification_reason}"
+        )
+
     return "\n".join(lines)
 
 
@@ -544,13 +730,16 @@ def run_once(router: DataRouter) -> List[MarketStateResult]:
 
             swings = detect_swings(ohlcv.candles, n=SWING_N)
             structure_events = build_structure(swings)
-            state = classify_state(structure_events, window=EVIDENCE_WINDOW)
+            state, reason = classify_state_detailed(structure_events, window=EVIDENCE_WINDOW)
 
             recent_labels = [
                 e.label for e in
                 (structure_events[-EVIDENCE_WINDOW:] if len(structure_events) >= EVIDENCE_WINDOW
                  else structure_events)
             ]
+
+            swing_high_count = sum(1 for s in swings if s.swing_type == SwingType.HIGH)
+            swing_low_count = sum(1 for s in swings if s.swing_type == SwingType.LOW)
 
             results.append(MarketStateResult(
                 symbol=symbol,
@@ -561,6 +750,14 @@ def run_once(router: DataRouter) -> List[MarketStateResult]:
                 recent_structure=recent_labels,
                 swing_count=len(swings),
                 error=None,
+                raw_candle_count=ohlcv.raw_candle_count,
+                duplicates_removed=ohlcv.duplicates_removed,
+                forming_candle_removed=ohlcv.forming_candle_removed,
+                closed_candle_count=ohlcv.closed_candle_count,
+                swing_high_count=swing_high_count,
+                swing_low_count=swing_low_count,
+                structure_event_count=len(structure_events),
+                classification_reason=reason,
             ))
 
     return results
