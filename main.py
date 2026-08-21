@@ -150,6 +150,8 @@ class MarketStateResult:
     swing_low_count: int = 0
     structure_event_count: int = 0
     classification_reason: str = ""
+    # Phase 2A — Range Detection result (SSOT2, independent of SSOT1 state)
+    range_result: Optional["RangeResult"] = None
 
 
 # ============================================================================
@@ -480,6 +482,226 @@ MAX_RANGING_IMBALANCE = 1
 MIN_EVENTS_FOR_ANY_CALL = 3
 
 
+# ============================================================================
+# SSOT2 — PHASE 2A: RANGE DETECTION
+# ============================================================================
+#
+# Range Detection is deliberately independent of the SSOT1 market-state
+# classifier above. A coin classified RANGING is NOT treated as proof a
+# genuine range exists, and a coin classified TRANSITION/BULLISH/BEARISH
+# is not excluded from having a valid prior range on record. This section
+# consumes SSOT1's already-computed outputs (closed candles + confirmed
+# swings) as its only inputs — it does not fetch, normalize, or dedupe
+# anything itself, and it never modifies SSOT1's behavior.
+
+# Two confirmed swing prices are considered part of the same boundary
+# cluster if they fall within this percentage of each other.
+BOUNDARY_TOLERANCE_PCT = 0.50
+
+# Containment check allows candle highs/lows to exceed the boundary by
+# this percentage before it counts as a genuine breach.
+CONTAINMENT_BUFFER_PCT = 0.10
+
+# A boundary (upper or lower) needs at least this many qualifying
+# confirmed swings in its cluster to count as established.
+MIN_BOUNDARY_TESTS = 2
+
+# Upper and lower boundaries must be separated by at least this
+# percentage (relative to the lower boundary) to count as a real range
+# rather than noise.
+MIN_RANGE_WIDTH_PCT = 0.50
+
+# Minimum number of the timeframe's OWN closed candles the range must
+# span (24 on 5m = 24 five-minute candles; 24 on 1h = 24 one-hour
+# candles — never converted to a fixed wall-clock duration).
+MIN_RANGE_CANDLES = 24
+
+# Compression check: the recent portion of the range's high-low envelope
+# must be at least this percentage narrower than the earlier portion's
+# envelope to be flagged as compressing. See _detect_compression() for
+# the exact calculation. This is a candle-geometry comparison only —
+# no indicators are involved.
+COMPRESSION_THRESHOLD_PCT = 20.0
+
+
+@dataclass(frozen=True)
+class RangeResult:
+    detected: bool
+    reason: str
+    upper_boundary: Optional[float] = None
+    lower_boundary: Optional[float] = None
+    width_absolute: Optional[float] = None
+    width_percent: Optional[float] = None
+    duration_candles: Optional[int] = None
+    duration_time: Optional[str] = None
+    upper_tests: Optional[int] = None
+    lower_tests: Optional[int] = None
+    current_price: Optional[float] = None
+    current_position_percent: Optional[float] = None
+    compression: Optional[bool] = None
+
+
+def _cluster_by_tolerance(prices_with_swings, tolerance_pct: float):
+    """
+    Deterministic 1D clustering: sort ascending, then greedily merge each
+    next price into the current cluster if it's within tolerance_pct of
+    that cluster's RUNNING AVERAGE (not just the last point added) — this
+    keeps the whole cluster tightly bounded around a representative level
+    rather than letting it drift arbitrarily wide through chained
+    pairwise comparisons. prices_with_swings is a list of
+    (price, SwingPoint) tuples. Returns a list of clusters, each a list
+    of (price, SwingPoint) tuples.
+    """
+    if not prices_with_swings:
+        return []
+
+    ordered = sorted(prices_with_swings, key=lambda ps: ps[0])
+    clusters = [[ordered[0]]]
+
+    for price, swing in ordered[1:]:
+        current_cluster = clusters[-1]
+        running_average = sum(p for p, _ in current_cluster) / len(current_cluster)
+        tolerance = running_average * (tolerance_pct / 100.0)
+        if abs(price - running_average) <= tolerance:
+            current_cluster.append((price, swing))
+        else:
+            clusters.append([(price, swing)])
+
+    return clusters
+
+
+def _detect_compression(candles: List[Candle], start_index: int) -> Optional[bool]:
+    """
+    Splits candles[start_index:] into an earlier half and a recent half
+    (by candle count). For each half, the "effective envelope" is
+    max(high) - min(low) across that half's candles — pure candle
+    geometry, no indicators. Compression is flagged True only when the
+    recent envelope is at least COMPRESSION_THRESHOLD_PCT narrower than
+    the earlier envelope. Returns None when there isn't enough data
+    (fewer than 2 candles in either half) to make the comparison
+    meaningful.
+    """
+    span = candles[start_index:]
+    if len(span) < 4:
+        return None
+
+    midpoint = len(span) // 2
+    earlier_half = span[:midpoint]
+    recent_half = span[midpoint:]
+
+    if len(earlier_half) < 2 or len(recent_half) < 2:
+        return None
+
+    earlier_envelope = max(c.high for c in earlier_half) - min(c.low for c in earlier_half)
+    recent_envelope = max(c.high for c in recent_half) - min(c.low for c in recent_half)
+
+    if earlier_envelope <= 0:
+        return None
+
+    narrowing_pct = (1 - (recent_envelope / earlier_envelope)) * 100.0
+    return narrowing_pct >= COMPRESSION_THRESHOLD_PCT
+
+
+def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str) -> RangeResult:
+    """
+    Phase 2A Range Detection. Consumes SSOT1's already-computed closed
+    candles and confirmed swings only — no fetching, no re-validation of
+    candle data, no look-ahead (only ever reads candles/swings already
+    confirmed by SSOT1's existing centered-swing methodology).
+    """
+    swing_highs = [(s.price, s) for s in swings if s.swing_type == SwingType.HIGH]
+    swing_lows = [(s.price, s) for s in swings if s.swing_type == SwingType.LOW]
+
+    if not swing_highs or not swing_lows:
+        return RangeResult(detected=False, reason="no coherent boundary clusters")
+
+    high_clusters = _cluster_by_tolerance(swing_highs, BOUNDARY_TOLERANCE_PCT)
+    low_clusters = _cluster_by_tolerance(swing_lows, BOUNDARY_TOLERANCE_PCT)
+
+    # Upper boundary candidate: the HIGHEST-priced cluster that meets the
+    # minimum test count (strongest, topmost resistance with enough
+    # confirmed touches).
+    qualifying_high_clusters = [c for c in high_clusters if len(c) >= MIN_BOUNDARY_TESTS]
+    # Lower boundary candidate: the LOWEST-priced cluster that meets the
+    # minimum test count (strongest, bottommost support).
+    qualifying_low_clusters = [c for c in low_clusters if len(c) >= MIN_BOUNDARY_TESTS]
+
+    if not qualifying_high_clusters and not qualifying_low_clusters:
+        return RangeResult(detected=False, reason="insufficient boundary tests on both sides")
+    if not qualifying_high_clusters:
+        return RangeResult(detected=False, reason="insufficient boundary tests on upper side")
+    if not qualifying_low_clusters:
+        return RangeResult(detected=False, reason="insufficient boundary tests on lower side")
+
+    upper_cluster = max(qualifying_high_clusters, key=lambda c: c[0][0])
+    lower_cluster = min(qualifying_low_clusters, key=lambda c: c[0][0])
+
+    upper_boundary = sum(p for p, _ in upper_cluster) / len(upper_cluster)
+    lower_boundary = sum(p for p, _ in lower_cluster) / len(lower_cluster)
+    upper_tests = len(upper_cluster)
+    lower_tests = len(lower_cluster)
+
+    if upper_boundary <= lower_boundary:
+        return RangeResult(detected=False, reason="no coherent boundary clusters")
+
+    width_absolute = upper_boundary - lower_boundary
+    width_percent = (width_absolute / lower_boundary) * 100.0
+
+    if width_percent < MIN_RANGE_WIDTH_PCT:
+        return RangeResult(detected=False, reason="boundaries not sufficiently separated")
+
+    # First boundary-defining swing: earliest (by candle index) among
+    # every swing that belongs to either qualifying cluster.
+    all_boundary_swings = [s for _, s in upper_cluster] + [s for _, s in lower_cluster]
+    first_swing_index = min(s.index for s in all_boundary_swings)
+
+    duration_candles = len(candles) - first_swing_index
+    if duration_candles < MIN_RANGE_CANDLES:
+        return RangeResult(detected=False, reason="range too short")
+
+    # Containment: EVERY closed candle from the first boundary-defining
+    # swing through the latest closed candle must stay within the
+    # boundaries plus the configured buffer. A wick breach counts even
+    # if price later returns inside.
+    upper_limit = upper_boundary * (1 + CONTAINMENT_BUFFER_PCT / 100.0)
+    lower_limit = lower_boundary * (1 - CONTAINMENT_BUFFER_PCT / 100.0)
+    span_candles = candles[first_swing_index:]
+
+    for c in span_candles:
+        if c.high > upper_limit or c.low < lower_limit:
+            return RangeResult(detected=False, reason="price not contained")
+
+    current_price = candles[-1].close
+    current_position_percent = ((current_price - lower_boundary) / width_absolute) * 100.0
+    compression = _detect_compression(candles, first_swing_index)
+
+    tf_ms = TIMEFRAME_MS.get(timeframe)
+    duration_time_str = f"{duration_candles} x {timeframe} candles"
+
+    reason = (
+        f"range confirmed: {upper_tests} upper tests, {lower_tests} lower tests, "
+        f"width={width_percent:.2f}%, duration={duration_candles} candles, "
+        f"fully contained (buffer={CONTAINMENT_BUFFER_PCT}%), "
+        f"compression={compression if compression is not None else 'insufficient data'}"
+    )
+
+    return RangeResult(
+        detected=True,
+        reason=reason,
+        upper_boundary=upper_boundary,
+        lower_boundary=lower_boundary,
+        width_absolute=width_absolute,
+        width_percent=width_percent,
+        duration_candles=duration_candles,
+        duration_time=duration_time_str,
+        upper_tests=upper_tests,
+        lower_tests=lower_tests,
+        current_price=current_price,
+        current_position_percent=current_position_percent,
+        compression=compression,
+    )
+
+
 def _is_pure_bullish(labels: List[StructureLabel]) -> bool:
     """All labels are HH/HL, AND both types are represented."""
     return (
@@ -664,6 +886,8 @@ def build_report_text(results: List[MarketStateResult]) -> str:
 
     lines.append("")
     lines.append(build_diagnostics_text(results))
+    lines.append("")
+    lines.append(build_range_report_text(results))
 
     return "\n".join(lines)
 
@@ -698,8 +922,52 @@ def build_diagnostics_text(results: List[MarketStateResult]) -> str:
     return "\n".join(lines)
 
 
+def build_range_report_text(results: List[MarketStateResult]) -> str:
+    """
+    Phase 2A Range Detection diagnostic table, as required:
+    COIN | TF | MARKET STATE | RANGE DETECTED | UPPER | LOWER | WIDTH |
+    DURATION | UPPER TESTS | LOWER TESTS | POSITION | COMPRESSION | REASON
+    """
+    header = (
+        f"{'COIN':<6} {'TF':<5} {'STATE':<12} {'RANGE':<7} {'UPPER':<12} "
+        f"{'LOWER':<12} {'WIDTH%':<8} {'DUR':<10} {'UTEST':<6} {'LTEST':<6} "
+        f"{'POS%':<8} {'COMPR':<8} REASON"
+    )
+    lines = ["RANGE DETECTION (Phase 2A)", header, "-" * len(header)]
+
+    for r in results:
+        if r.error:
+            lines.append(f"{r.symbol:<6} {r.timeframe:<5} NO DATA")
+            continue
+
+        rr = r.range_result
+        if rr is None:
+            lines.append(f"{r.symbol:<6} {r.timeframe:<5} {format_state(r):<12} (not computed)")
+            continue
+
+        if not rr.detected:
+            lines.append(
+                f"{r.symbol:<6} {r.timeframe:<5} {format_state(r):<12} {'NO':<7} "
+                f"{'-':<12} {'-':<12} {'-':<8} {'-':<10} {'-':<6} {'-':<6} "
+                f"{'-':<8} {'-':<8} {rr.reason}"
+            )
+            continue
+
+        compr_str = "YES" if rr.compression is True else ("NO" if rr.compression is False else "N/A")
+        lines.append(
+            f"{r.symbol:<6} {r.timeframe:<5} {format_state(r):<12} {'YES':<7} "
+            f"{rr.upper_boundary:<12.6f} {rr.lower_boundary:<12.6f} "
+            f"{rr.width_percent:<8.2f} {rr.duration_time:<10} "
+            f"{rr.upper_tests:<6} {rr.lower_tests:<6} "
+            f"{rr.current_position_percent:<8.2f} {compr_str:<8} {rr.reason}"
+        )
+
+    return "\n".join(lines)
+
+
 def print_report(results: List[MarketStateResult]) -> None:
     print(build_report_text(results))
+
 
 
 # ============================================================================
@@ -741,6 +1009,11 @@ def run_once(router: DataRouter) -> List[MarketStateResult]:
             swing_high_count = sum(1 for s in swings if s.swing_type == SwingType.HIGH)
             swing_low_count = sum(1 for s in swings if s.swing_type == SwingType.LOW)
 
+            # Phase 2A — Range Detection (SSOT2). Reuses SSOT1's own
+            # closed candles and confirmed swings; no new fetching, no
+            # re-validation, no modification of SSOT1's outputs.
+            range_result = detect_range(ohlcv.candles, swings, timeframe)
+
             results.append(MarketStateResult(
                 symbol=symbol,
                 timeframe=timeframe,
@@ -758,6 +1031,7 @@ def run_once(router: DataRouter) -> List[MarketStateResult]:
                 swing_low_count=swing_low_count,
                 structure_event_count=len(structure_events),
                 classification_reason=reason,
+                range_result=range_result,
             ))
 
     return results
