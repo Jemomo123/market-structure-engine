@@ -495,8 +495,14 @@ MIN_EVENTS_FOR_ANY_CALL = 3
 # anything itself, and it never modifies SSOT1's behavior.
 
 # Two confirmed swing prices are considered part of the same boundary
-# cluster if they fall within this percentage of each other.
-BOUNDARY_TOLERANCE_PCT = 0.50
+# cluster if they fall within this percentage of each other. Tightened
+# from the initial 0.50% baseline after live validation showed 0/30
+# ranges detected, all rejected at containment — a 0.50% cluster was
+# permitted to span wider than the 0.10% containment buffer could
+# accept. Containment buffer is intentionally left unchanged (it exists
+# to absorb normal wick/price noise around an established boundary, not
+# to compensate for an overly loose boundary cluster).
+BOUNDARY_TOLERANCE_PCT = 0.10
 
 # Containment check allows candle highs/lows to exceed the boundary by
 # this percentage before it counts as a genuine breach.
