@@ -529,6 +529,35 @@ MIN_RANGE_CANDLES = 24
 # no indicators are involved.
 COMPRESSION_THRESHOLD_PCT = 20.0
 
+# --- Quality corrections (supervisor decision, post-live-review) ---
+#
+# Live validation showed boundary clustering + test count + containment +
+# duration was NOT sufficient: candidates like "LOW -> strong directional
+# move -> HIGH" with 2 touches near each extreme passed as "ranges" when
+# they were actually one-directional moves with brief consolidation at
+# each end, not genuine back-and-forth oscillation. Two new deterministic
+# checks address this — see _check_alternation() and the directional-
+# dominance calculation in detect_range().
+
+# Minimum number of alternating transitions required among the
+# chronologically-ordered qualifying boundary touches (upper/lower). A
+# transition is any adjacent pair of touches on OPPOSITE boundaries.
+# Default of 3 requires at least 4 touches in strict alternation
+# (e.g. LOW -> HIGH -> LOW -> HIGH) — exactly matching MIN_BOUNDARY_TESTS's
+# existing minimum of 2 touches per side, just requiring them to actually
+# interleave rather than cluster in time (LOW,LOW,HIGH,HIGH fails this).
+MIN_BOUNDARY_ALTERNATIONS = 3
+
+# Directional-dominance check: computed as
+# net_displacement / total_zigzag_path_length across all confirmed swings
+# between the first and last qualifying boundary touch. A ratio near 1.0
+# means the price path was essentially one straight run (little real
+# back-and-forth); a ratio well below 1.0 means genuine oscillation
+# covered much more ground than the net start-to-end move. A candidate
+# is rejected if its ratio is >= this threshold. This is pure swing/price
+# geometry — no indicators.
+MAX_DIRECTIONAL_DOMINANCE_RATIO = 0.50
+
 
 @dataclass(frozen=True)
 class RangeResult:
@@ -545,6 +574,8 @@ class RangeResult:
     current_price: Optional[float] = None
     current_position_percent: Optional[float] = None
     compression: Optional[bool] = None
+    boundary_touch_sequence: Optional[str] = None
+    directional_dominance_ratio: Optional[float] = None
 
 
 def _cluster_by_tolerance(prices_with_swings, tolerance_pct: float):
@@ -608,6 +639,31 @@ def _detect_compression(candles: List[Candle], start_index: int) -> Optional[boo
     return narrowing_pct >= COMPRESSION_THRESHOLD_PCT
 
 
+def _check_alternation(upper_cluster, lower_cluster):
+    """
+    Combines the qualifying upper-boundary and lower-boundary touches,
+    orders them chronologically by swing index, and checks whether they
+    alternate between the two boundaries.
+
+    Returns (fully_alternating: bool, transition_count: int, sequence_str: str).
+
+    A transition is any adjacent pair of touches on OPPOSITE boundaries.
+    fully_alternating is True only when EVERY adjacent pair differs (no
+    two consecutive touches on the same boundary) — e.g. L,H,L,H passes;
+    L,L,H,H fails (grouped, not oscillating) even though it has 2 tests
+    on each side.
+    """
+    touches = [(s.index, "U") for _, s in upper_cluster] + [(s.index, "L") for _, s in lower_cluster]
+    touches.sort(key=lambda t: t[0])
+    labels = [side for _, side in touches]
+
+    transition_count = sum(1 for i in range(1, len(labels)) if labels[i] != labels[i - 1])
+    fully_alternating = all(labels[i] != labels[i - 1] for i in range(1, len(labels))) if len(labels) > 1 else False
+    sequence_str = "-".join(labels)
+
+    return fully_alternating, transition_count, sequence_str
+
+
 def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str) -> RangeResult:
     """
     Phase 2A Range Detection. Consumes SSOT1's already-computed closed
@@ -656,14 +712,75 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
     if width_percent < MIN_RANGE_WIDTH_PCT:
         return RangeResult(detected=False, reason="boundaries not sufficiently separated")
 
+    # --- NEW: Alternation check ---
+    # A genuine range requires actual back-and-forth interaction between
+    # the two boundaries, not just 2+ touches on each side that happen to
+    # be grouped in time (e.g. LOW,LOW,HIGH,HIGH = one directional move
+    # with brief consolidation at each end, not oscillation).
+    fully_alternating, transition_count, touch_sequence = _check_alternation(upper_cluster, lower_cluster)
+
+    if not fully_alternating:
+        return RangeResult(
+            detected=False,
+            reason=f"boundary touches not alternating (grouped, not oscillating) — sequence: {touch_sequence}",
+            boundary_touch_sequence=touch_sequence,
+        )
+    if transition_count < MIN_BOUNDARY_ALTERNATIONS:
+        return RangeResult(
+            detected=False,
+            reason=f"insufficient alternating interactions ({transition_count} < {MIN_BOUNDARY_ALTERNATIONS}) — sequence: {touch_sequence}",
+            boundary_touch_sequence=touch_sequence,
+        )
+
     # First boundary-defining swing: earliest (by candle index) among
     # every swing that belongs to either qualifying cluster.
     all_boundary_swings = [s for _, s in upper_cluster] + [s for _, s in lower_cluster]
     first_swing_index = min(s.index for s in all_boundary_swings)
+    last_touch_index = max(s.index for s in all_boundary_swings)
+
+    # --- NEW: Directional-dominance check ---
+    # Distinguishes genuine oscillation (LOW -> up -> HIGH -> down -> LOW
+    # -> up -> HIGH, lots of back-and-forth) from one large directional
+    # run that merely started and ended near the cluster levels (LOW ->
+    # steadily upward -> HIGH). Uses the FULL confirmed swing path
+    # between the first and last boundary touch — not just the touches
+    # themselves — so intermediate real price movement counts too.
+    span_swings = [s for s in swings if first_swing_index <= s.index <= last_touch_index]
+    span_swings.sort(key=lambda s: s.index)
+
+    if len(span_swings) >= 2:
+        total_path = sum(
+            abs(span_swings[i].price - span_swings[i - 1].price)
+            for i in range(1, len(span_swings))
+        )
+        net_displacement = abs(span_swings[-1].price - span_swings[0].price)
+        dominance_ratio = (net_displacement / total_path) if total_path > 0 else 1.0
+    else:
+        # Not enough swings to compute a meaningful path — treat as
+        # maximally dominant (fails the check) rather than silently
+        # skipping it.
+        dominance_ratio = 1.0
+
+    if dominance_ratio >= MAX_DIRECTIONAL_DOMINANCE_RATIO:
+        return RangeResult(
+            detected=False,
+            reason=(
+                f"movement is a single dominant directional run "
+                f"(net/path ratio={dominance_ratio:.2f} >= {MAX_DIRECTIONAL_DOMINANCE_RATIO}), "
+                f"not genuine oscillation — sequence: {touch_sequence}"
+            ),
+            boundary_touch_sequence=touch_sequence,
+            directional_dominance_ratio=dominance_ratio,
+        )
 
     duration_candles = len(candles) - first_swing_index
     if duration_candles < MIN_RANGE_CANDLES:
-        return RangeResult(detected=False, reason="range too short")
+        return RangeResult(
+            detected=False,
+            reason="range too short",
+            boundary_touch_sequence=touch_sequence,
+            directional_dominance_ratio=dominance_ratio,
+        )
 
     # Containment: EVERY closed candle from the first boundary-defining
     # swing through the latest closed candle must stay within the
@@ -675,7 +792,12 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
 
     for c in span_candles:
         if c.high > upper_limit or c.low < lower_limit:
-            return RangeResult(detected=False, reason="price not contained")
+            return RangeResult(
+                detected=False,
+                reason="price not contained",
+                boundary_touch_sequence=touch_sequence,
+                directional_dominance_ratio=dominance_ratio,
+            )
 
     current_price = candles[-1].close
     current_position_percent = ((current_price - lower_boundary) / width_absolute) * 100.0
@@ -688,6 +810,8 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
         f"range confirmed: {upper_tests} upper tests, {lower_tests} lower tests, "
         f"width={width_percent:.2f}%, duration={duration_candles} candles, "
         f"fully contained (buffer={CONTAINMENT_BUFFER_PCT}%), "
+        f"alternating touches ({touch_sequence}, {transition_count} transitions), "
+        f"dominance_ratio={dominance_ratio:.2f}, "
         f"compression={compression if compression is not None else 'insufficient data'}"
     )
 
@@ -705,6 +829,8 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
         current_price=current_price,
         current_position_percent=current_position_percent,
         compression=compression,
+        boundary_touch_sequence=touch_sequence,
+        directional_dominance_ratio=dominance_ratio,
     )
 
 
