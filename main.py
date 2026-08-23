@@ -152,6 +152,8 @@ class MarketStateResult:
     classification_reason: str = ""
     # Phase 2A — Range Detection result (SSOT2, independent of SSOT1 state)
     range_result: Optional["RangeResult"] = None
+    # Phase 2B — Breakout Readiness (only meaningful when range_result.detected)
+    breakout_readiness: Optional["BreakoutReadinessResult"] = None
 
 
 # ============================================================================
@@ -576,6 +578,11 @@ class RangeResult:
     compression: Optional[bool] = None
     boundary_touch_sequence: Optional[str] = None
     directional_dominance_ratio: Optional[float] = None
+    # Raw touch swings, populated only on a successful detection, so
+    # Phase 2B can reuse the EXACT same boundary-defining touches without
+    # recomputing clustering.
+    upper_touch_swings: Optional[List[SwingPoint]] = None
+    lower_touch_swings: Optional[List[SwingPoint]] = None
 
 
 def _cluster_by_tolerance(prices_with_swings, tolerance_pct: float):
@@ -831,6 +838,128 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
         compression=compression,
         boundary_touch_sequence=touch_sequence,
         directional_dominance_ratio=dominance_ratio,
+        upper_touch_swings=[s for _, s in upper_cluster],
+        lower_touch_swings=[s for _, s in lower_cluster],
+    )
+
+
+# ============================================================================
+# SSOT2 — PHASE 2B: BREAKOUT READINESS (structural tension only)
+# ============================================================================
+#
+# Phase 2B answers exactly one question, symmetrically, for each boundary
+# of an ALREADY-CONFIRMED range: who is winning the fight at that
+# boundary — buyers or sellers? It does NOT predict which way the range
+# will ultimately break, does NOT combine both boundaries into one
+# verdict, and is NEVER computed for a coin/timeframe where Phase 2A did
+# not confirm a range (there's nothing to evaluate readiness against).
+#
+# Per-boundary meaning:
+#   - Resistance (upper), buyers winning  -> BULLISH BREAKOUT IMMINENT
+#   - Resistance (upper), sellers winning -> SELLERS DEFENDING RESISTANCE
+#   - Support (lower), buyers winning     -> BUYERS DEFENDING SUPPORT
+#   - Support (lower), sellers winning    -> BEARISH BREAKOUT IMMINENT
+#   - Neither side clearly ahead          -> CONTESTED
+#
+# "Winning" is measured purely from each boundary-touch candle's own
+# OHLC — no indicators, no volume (deliberately deferred), no lookahead:
+# only the exact same confirmed touch candles Phase 2A already used to
+# define that boundary.
+
+# A touch's close-position-in-candle is
+# (close - low) / (high - low), a value from 0.0 (closed at the low) to
+# 1.0 (closed at the high). This single measure is interpreted the SAME
+# way at both boundaries: a close near the HIGH of its own candle means
+# buyers pushed price back up before the candle closed (buyers won that
+# test), regardless of whether the test was at resistance (pushing
+# through and holding) or at support (defending, bouncing back up). A
+# close near the LOW means sellers won that test, at either boundary.
+#
+# Average this across all confirmed touches at a boundary:
+#   average >= BUYER_CONTROL_THRESHOLD  -> buyers winning that boundary
+#   average <= SELLER_CONTROL_THRESHOLD -> sellers winning that boundary
+#   otherwise                            -> CONTESTED, no clear control
+BUYER_CONTROL_THRESHOLD = 0.60
+SELLER_CONTROL_THRESHOLD = 0.40
+
+
+@dataclass(frozen=True)
+class BoundaryControlResult:
+    verdict: str  # one of the 5 labels above (or "CONTESTED")
+    avg_close_position: float
+    touch_count: int
+    per_touch_positions: List[float]
+
+
+@dataclass(frozen=True)
+class BreakoutReadinessResult:
+    applicable: bool
+    reason: str
+    upper: Optional[BoundaryControlResult] = None
+    lower: Optional[BoundaryControlResult] = None
+
+
+def _close_position_in_candle(candle: Candle) -> float:
+    """(close - low) / (high - low), clamped to [0, 1]. Returns 0.5 for
+    a degenerate zero-range candle (high == low) — genuinely ambiguous,
+    not a lean toward either side."""
+    span = candle.high - candle.low
+    if span <= 0:
+        return 0.5
+    position = (candle.close - candle.low) / span
+    return max(0.0, min(1.0, position))
+
+
+def _evaluate_boundary_control(candles: List[Candle], touch_swings: List[SwingPoint], is_upper: bool) -> BoundaryControlResult:
+    positions = [_close_position_in_candle(candles[s.index]) for s in touch_swings]
+    avg_position = sum(positions) / len(positions)
+
+    buyers_winning = avg_position >= BUYER_CONTROL_THRESHOLD
+    sellers_winning = avg_position <= SELLER_CONTROL_THRESHOLD
+
+    if is_upper:
+        if buyers_winning:
+            verdict = "BULLISH BREAKOUT IMMINENT"
+        elif sellers_winning:
+            verdict = "SELLERS DEFENDING RESISTANCE"
+        else:
+            verdict = "CONTESTED"
+    else:
+        if buyers_winning:
+            verdict = "BUYERS DEFENDING SUPPORT"
+        elif sellers_winning:
+            verdict = "BEARISH BREAKOUT IMMINENT"
+        else:
+            verdict = "CONTESTED"
+
+    return BoundaryControlResult(
+        verdict=verdict,
+        avg_close_position=avg_position,
+        touch_count=len(touch_swings),
+        per_touch_positions=positions,
+    )
+
+
+def compute_breakout_readiness(candles: List[Candle], range_result: RangeResult) -> BreakoutReadinessResult:
+    """
+    Only ever computed for an ALREADY-CONFIRMED range (range_result.detected
+    == True). Reuses Phase 2A's exact touch swings — no re-fetching, no
+    re-clustering, no new candle data.
+    """
+    if not range_result.detected:
+        return BreakoutReadinessResult(applicable=False, reason="no confirmed range detected")
+
+    if not range_result.upper_touch_swings or not range_result.lower_touch_swings:
+        return BreakoutReadinessResult(applicable=False, reason="range confirmed but touch data unavailable")
+
+    upper_control = _evaluate_boundary_control(candles, range_result.upper_touch_swings, is_upper=True)
+    lower_control = _evaluate_boundary_control(candles, range_result.lower_touch_swings, is_upper=False)
+
+    return BreakoutReadinessResult(
+        applicable=True,
+        reason="evaluated from confirmed boundary-touch candles",
+        upper=upper_control,
+        lower=lower_control,
     )
 
 
@@ -1020,6 +1149,8 @@ def build_report_text(results: List[MarketStateResult]) -> str:
     lines.append(build_diagnostics_text(results))
     lines.append("")
     lines.append(build_range_report_text(results))
+    lines.append("")
+    lines.append(build_breakout_readiness_text(results))
 
     return "\n".join(lines)
 
@@ -1097,6 +1228,42 @@ def build_range_report_text(results: List[MarketStateResult]) -> str:
     return "\n".join(lines)
 
 
+def build_breakout_readiness_text(results: List[MarketStateResult]) -> str:
+    """
+    Phase 2B Breakout Readiness diagnostic table. Only ever populated for
+    rows where Phase 2A confirmed a range — every other row shows
+    N/A (no confirmed range), never a guessed or defaulted verdict.
+    Each boundary is reported independently; there is no combined
+    "overall" verdict, since the two sides can disagree.
+    """
+    header = (
+        f"{'COIN':<6} {'TF':<5} {'RANGE':<7} "
+        f"{'UPPER VERDICT':<28} {'U-POS':<7} {'UTESTS':<7} "
+        f"{'LOWER VERDICT':<26} {'L-POS':<7} {'LTESTS':<7}"
+    )
+    lines = ["BREAKOUT READINESS (Phase 2B) — structural tension only, NOT a directional prediction",
+              header, "-" * len(header)]
+
+    for r in results:
+        if r.error:
+            lines.append(f"{r.symbol:<6} {r.timeframe:<5} NO DATA")
+            continue
+
+        br = r.breakout_readiness
+        if br is None or not br.applicable:
+            reason = br.reason if br is not None else "not computed"
+            lines.append(f"{r.symbol:<6} {r.timeframe:<5} {'NO':<7} N/A — {reason}")
+            continue
+
+        lines.append(
+            f"{r.symbol:<6} {r.timeframe:<5} {'YES':<7} "
+            f"{br.upper.verdict:<28} {br.upper.avg_close_position:<7.2f} {br.upper.touch_count:<7} "
+            f"{br.lower.verdict:<26} {br.lower.avg_close_position:<7.2f} {br.lower.touch_count:<7}"
+        )
+
+    return "\n".join(lines)
+
+
 def print_report(results: List[MarketStateResult]) -> None:
     print(build_report_text(results))
 
@@ -1146,6 +1313,11 @@ def run_once(router: DataRouter) -> List[MarketStateResult]:
             # re-validation, no modification of SSOT1's outputs.
             range_result = detect_range(ohlcv.candles, swings, timeframe)
 
+            # Phase 2B — Breakout Readiness. Only meaningful for an
+            # already-confirmed range; compute_breakout_readiness itself
+            # returns applicable=False otherwise.
+            breakout_readiness = compute_breakout_readiness(ohlcv.candles, range_result)
+
             results.append(MarketStateResult(
                 symbol=symbol,
                 timeframe=timeframe,
@@ -1164,6 +1336,7 @@ def run_once(router: DataRouter) -> List[MarketStateResult]:
                 structure_event_count=len(structure_events),
                 classification_reason=reason,
                 range_result=range_result,
+                breakout_readiness=breakout_readiness,
             ))
 
     return results
