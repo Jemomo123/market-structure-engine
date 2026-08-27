@@ -560,11 +560,37 @@ MIN_BOUNDARY_ALTERNATIONS = 3
 # geometry — no indicators.
 MAX_DIRECTIONAL_DOMINANCE_RATIO = 0.50
 
+# --- Bounded lookback correction (v2 redesign, post 5x live-failure review) ---
+#
+# Root cause of 5/5 live passes returning 0/30 confirmed ranges: boundary
+# candidates were being searched across the ENTIRE fetched history (up to
+# 299 candles), and containment was required to hold unbroken all the way
+# to the present candle. Proven via synthetic test that this rejects even
+# a perfectly genuine historical range purely because price moved on
+# afterward. Fix: bound the candidate search to a recent window, and
+# classify (rather than blanket-reject) whatever happened after a range's
+# contained life ends.
+
+# Only swings within this many most-recent closed candles are eligible to
+# form boundary candidates. An ancient touch can never pair with a recent
+# one — they're no longer in the same search universe at all. Initial
+# estimate (4x MIN_RANGE_CANDLES, giving room for a minimum-length range
+# to form AND still be observable afterward) — not empirically tuned.
+RANGE_LOOKBACK_CANDLES = 96
+
+# How many candles ago a boundary breach must have occurred to still
+# count as "recent" rather than "the market has moved on a while ago".
+# Initial estimate (~1/3 of MIN_RANGE_CANDLES) — not empirically tuned.
+RECENT_BREAK_CANDLES = 8
+
 
 @dataclass(frozen=True)
 class RangeResult:
-    detected: bool
+    detected: bool  # True ONLY when status == "ACTIVE" — preserved for
+                     # Phase 2B's existing dependency check.
     reason: str
+    # Four-way outcome: "ACTIVE", "RECENTLY_BROKEN", "EXPIRED", "NO_RANGE"
+    status: str = "NO_RANGE"
     upper_boundary: Optional[float] = None
     lower_boundary: Optional[float] = None
     width_absolute: Optional[float] = None
@@ -578,11 +604,16 @@ class RangeResult:
     compression: Optional[bool] = None
     boundary_touch_sequence: Optional[str] = None
     directional_dominance_ratio: Optional[float] = None
-    # Raw touch swings, populated only on a successful detection, so
-    # Phase 2B can reuse the EXACT same boundary-defining touches without
-    # recomputing clustering.
+    # Raw touch swings, populated only for ACTIVE/RECENTLY_BROKEN/EXPIRED
+    # (i.e. whenever a genuine candidate was found), so Phase 2B can reuse
+    # the EXACT same boundary-defining touches without recomputing
+    # clustering.
     upper_touch_swings: Optional[List[SwingPoint]] = None
     lower_touch_swings: Optional[List[SwingPoint]] = None
+    # New in v2: breach diagnostics
+    breach_index: Optional[int] = None
+    candles_since_breach: Optional[int] = None
+    lookback_candles_used: Optional[int] = None
 
 
 def _cluster_by_tolerance(prices_with_swings, tolerance_pct: float):
@@ -614,18 +645,25 @@ def _cluster_by_tolerance(prices_with_swings, tolerance_pct: float):
     return clusters
 
 
-def _detect_compression(candles: List[Candle], start_index: int) -> Optional[bool]:
+def _detect_compression(candles: List[Candle], start_index: int, end_index: Optional[int] = None) -> Optional[bool]:
     """
-    Splits candles[start_index:] into an earlier half and a recent half
-    (by candle count). For each half, the "effective envelope" is
+    Splits candles[start_index:end_index] (end_index exclusive; defaults
+    to the end of the list) into an earlier half and a recent half (by
+    candle count). For each half, the "effective envelope" is
     max(high) - min(low) across that half's candles — pure candle
     geometry, no indicators. Compression is flagged True only when the
     recent envelope is at least COMPRESSION_THRESHOLD_PCT narrower than
     the earlier envelope. Returns None when there isn't enough data
     (fewer than 2 candles in either half) to make the comparison
     meaningful.
+
+    v2 note: end_index lets compression be scoped to a range's own
+    CONTAINED lifetime (genesis through its breach point, or through
+    present if still active) rather than always running to the very end
+    of the fetched candle list — compression should describe the range's
+    own life, not whatever happened to price after it broke.
     """
-    span = candles[start_index:]
+    span = candles[start_index:end_index] if end_index is not None else candles[start_index:]
     if len(span) < 4:
         return None
 
@@ -673,34 +711,58 @@ def _check_alternation(upper_cluster, lower_cluster):
 
 def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str) -> RangeResult:
     """
-    Phase 2A Range Detection. Consumes SSOT1's already-computed closed
-    candles and confirmed swings only — no fetching, no re-validation of
-    candle data, no look-ahead (only ever reads candles/swings already
-    confirmed by SSOT1's existing centered-swing methodology).
+    Phase 2A Range Detection v2 — bounded lookback, breach-classified.
+
+    Consumes SSOT1's already-computed closed candles and confirmed swings
+    only — no fetching, no re-validation of candle data, no look-ahead.
+
+    v2 correction (post 5x live-failure review): boundary candidates are
+    now searched ONLY within the most recent RANGE_LOOKBACK_CANDLES
+    closed candles — an ancient touch can never pair with a recent one.
+    Containment is scanned forward from genesis and classified by WHEN
+    (if ever) a breach occurred, rather than blanket-rejecting any
+    candidate that doesn't survive unbroken all the way to the present.
     """
-    swing_highs = [(s.price, s) for s in swings if s.swing_type == SwingType.HIGH]
-    swing_lows = [(s.price, s) for s in swings if s.swing_type == SwingType.LOW]
+    total_candles = len(candles)
+    lookback_start_index = max(0, total_candles - RANGE_LOOKBACK_CANDLES)
+    lookback_candles_used = total_candles - lookback_start_index
+
+    lookback_swings = [s for s in swings if s.index >= lookback_start_index]
+
+    swing_highs = [(s.price, s) for s in lookback_swings if s.swing_type == SwingType.HIGH]
+    swing_lows = [(s.price, s) for s in lookback_swings if s.swing_type == SwingType.LOW]
 
     if not swing_highs or not swing_lows:
-        return RangeResult(detected=False, reason="no coherent boundary clusters")
+        return RangeResult(
+            detected=False, status="NO_RANGE",
+            reason=f"no coherent boundary clusters within lookback (last {lookback_candles_used} candles)",
+            lookback_candles_used=lookback_candles_used,
+        )
 
     high_clusters = _cluster_by_tolerance(swing_highs, BOUNDARY_TOLERANCE_PCT)
     low_clusters = _cluster_by_tolerance(swing_lows, BOUNDARY_TOLERANCE_PCT)
 
-    # Upper boundary candidate: the HIGHEST-priced cluster that meets the
-    # minimum test count (strongest, topmost resistance with enough
-    # confirmed touches).
     qualifying_high_clusters = [c for c in high_clusters if len(c) >= MIN_BOUNDARY_TESTS]
-    # Lower boundary candidate: the LOWEST-priced cluster that meets the
-    # minimum test count (strongest, bottommost support).
     qualifying_low_clusters = [c for c in low_clusters if len(c) >= MIN_BOUNDARY_TESTS]
 
     if not qualifying_high_clusters and not qualifying_low_clusters:
-        return RangeResult(detected=False, reason="insufficient boundary tests on both sides")
+        return RangeResult(
+            detected=False, status="NO_RANGE",
+            reason=f"insufficient boundary tests on both sides within lookback (last {lookback_candles_used} candles)",
+            lookback_candles_used=lookback_candles_used,
+        )
     if not qualifying_high_clusters:
-        return RangeResult(detected=False, reason="insufficient boundary tests on upper side")
+        return RangeResult(
+            detected=False, status="NO_RANGE",
+            reason=f"insufficient boundary tests on upper side within lookback (last {lookback_candles_used} candles)",
+            lookback_candles_used=lookback_candles_used,
+        )
     if not qualifying_low_clusters:
-        return RangeResult(detected=False, reason="insufficient boundary tests on lower side")
+        return RangeResult(
+            detected=False, status="NO_RANGE",
+            reason=f"insufficient boundary tests on lower side within lookback (last {lookback_candles_used} candles)",
+            lookback_candles_used=lookback_candles_used,
+        )
 
     upper_cluster = max(qualifying_high_clusters, key=lambda c: c[0][0])
     lower_cluster = min(qualifying_low_clusters, key=lambda c: c[0][0])
@@ -711,48 +773,50 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
     lower_tests = len(lower_cluster)
 
     if upper_boundary <= lower_boundary:
-        return RangeResult(detected=False, reason="no coherent boundary clusters")
+        return RangeResult(
+            detected=False, status="NO_RANGE",
+            reason="no coherent boundary clusters",
+            lookback_candles_used=lookback_candles_used,
+        )
 
     width_absolute = upper_boundary - lower_boundary
     width_percent = (width_absolute / lower_boundary) * 100.0
 
     if width_percent < MIN_RANGE_WIDTH_PCT:
-        return RangeResult(detected=False, reason="boundaries not sufficiently separated")
+        return RangeResult(
+            detected=False, status="NO_RANGE",
+            reason="boundaries not sufficiently separated",
+            lookback_candles_used=lookback_candles_used,
+        )
 
-    # --- NEW: Alternation check ---
-    # A genuine range requires actual back-and-forth interaction between
-    # the two boundaries, not just 2+ touches on each side that happen to
-    # be grouped in time (e.g. LOW,LOW,HIGH,HIGH = one directional move
-    # with brief consolidation at each end, not oscillation).
+    # Alternation check — UNCHANGED mechanic, now operating on
+    # lookback-scoped touches only.
     fully_alternating, transition_count, touch_sequence = _check_alternation(upper_cluster, lower_cluster)
 
     if not fully_alternating:
         return RangeResult(
-            detected=False,
+            detected=False, status="NO_RANGE",
             reason=f"boundary touches not alternating (grouped, not oscillating) — sequence: {touch_sequence}",
             boundary_touch_sequence=touch_sequence,
+            lookback_candles_used=lookback_candles_used,
         )
     if transition_count < MIN_BOUNDARY_ALTERNATIONS:
         return RangeResult(
-            detected=False,
+            detected=False, status="NO_RANGE",
             reason=f"insufficient alternating interactions ({transition_count} < {MIN_BOUNDARY_ALTERNATIONS}) — sequence: {touch_sequence}",
             boundary_touch_sequence=touch_sequence,
+            lookback_candles_used=lookback_candles_used,
         )
 
-    # First boundary-defining swing: earliest (by candle index) among
-    # every swing that belongs to either qualifying cluster.
+    # Genesis: earliest (by candle index) among every swing that belongs
+    # to either qualifying cluster. This is where the candidate's life
+    # begins — nothing before this point is considered.
     all_boundary_swings = [s for _, s in upper_cluster] + [s for _, s in lower_cluster]
-    first_swing_index = min(s.index for s in all_boundary_swings)
+    genesis_index = min(s.index for s in all_boundary_swings)
     last_touch_index = max(s.index for s in all_boundary_swings)
 
-    # --- NEW: Directional-dominance check ---
-    # Distinguishes genuine oscillation (LOW -> up -> HIGH -> down -> LOW
-    # -> up -> HIGH, lots of back-and-forth) from one large directional
-    # run that merely started and ended near the cluster levels (LOW ->
-    # steadily upward -> HIGH). Uses the FULL confirmed swing path
-    # between the first and last boundary touch — not just the touches
-    # themselves — so intermediate real price movement counts too.
-    span_swings = [s for s in swings if first_swing_index <= s.index <= last_touch_index]
+    # Directional-dominance check — UNCHANGED mechanic.
+    span_swings = [s for s in swings if genesis_index <= s.index <= last_touch_index]
     span_swings.sort(key=lambda s: s.index)
 
     if len(span_swings) >= 2:
@@ -763,14 +827,11 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
         net_displacement = abs(span_swings[-1].price - span_swings[0].price)
         dominance_ratio = (net_displacement / total_path) if total_path > 0 else 1.0
     else:
-        # Not enough swings to compute a meaningful path — treat as
-        # maximally dominant (fails the check) rather than silently
-        # skipping it.
         dominance_ratio = 1.0
 
     if dominance_ratio >= MAX_DIRECTIONAL_DOMINANCE_RATIO:
         return RangeResult(
-            detected=False,
+            detected=False, status="NO_RANGE",
             reason=(
                 f"movement is a single dominant directional run "
                 f"(net/path ratio={dominance_ratio:.2f} >= {MAX_DIRECTIONAL_DOMINANCE_RATIO}), "
@@ -778,58 +839,53 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
             ),
             boundary_touch_sequence=touch_sequence,
             directional_dominance_ratio=dominance_ratio,
+            lookback_candles_used=lookback_candles_used,
         )
 
-    duration_candles = len(candles) - first_swing_index
-    if duration_candles < MIN_RANGE_CANDLES:
-        return RangeResult(
-            detected=False,
-            reason="range too short",
-            boundary_touch_sequence=touch_sequence,
-            directional_dominance_ratio=dominance_ratio,
-        )
-
-    # Containment: EVERY closed candle from the first boundary-defining
-    # swing through the latest closed candle must stay within the
-    # boundaries plus the configured buffer. A wick breach counts even
-    # if price later returns inside.
+    # --- NEW: forward breach scan from genesis, classify by WHEN (if
+    # ever) containment first broke, instead of blanket-rejecting any
+    # candidate that doesn't survive unbroken all the way to present. ---
     upper_limit = upper_boundary * (1 + CONTAINMENT_BUFFER_PCT / 100.0)
     lower_limit = lower_boundary * (1 - CONTAINMENT_BUFFER_PCT / 100.0)
-    span_candles = candles[first_swing_index:]
 
-    for c in span_candles:
+    breach_index = None
+    for idx in range(genesis_index, total_candles):
+        c = candles[idx]
         if c.high > upper_limit or c.low < lower_limit:
-            return RangeResult(
-                detected=False,
-                reason="price not contained",
-                boundary_touch_sequence=touch_sequence,
-                directional_dominance_ratio=dominance_ratio,
-            )
+            breach_index = idx
+            break
 
+    present_index = total_candles - 1
+    contained_end_index = breach_index - 1 if breach_index is not None else present_index
+    contained_duration = contained_end_index - genesis_index + 1
+
+    if contained_duration < MIN_RANGE_CANDLES:
+        return RangeResult(
+            detected=False, status="NO_RANGE",
+            reason=(
+                f"range too short (contained duration {contained_duration} "
+                f"< {MIN_RANGE_CANDLES} candles)"
+            ),
+            boundary_touch_sequence=touch_sequence,
+            directional_dominance_ratio=dominance_ratio,
+            lookback_candles_used=lookback_candles_used,
+        )
+
+    compression = _detect_compression(candles, genesis_index, contained_end_index + 1)
+    duration_time_str = f"{contained_duration} x {timeframe} candles"
+
+    # current_price / position are always reported relative to the
+    # boundaries — even for EXPIRED/RECENTLY_BROKEN, this tells us where
+    # price sits NOW relative to the old range, which is informative.
     current_price = candles[-1].close
     current_position_percent = ((current_price - lower_boundary) / width_absolute) * 100.0
-    compression = _detect_compression(candles, first_swing_index)
 
-    tf_ms = TIMEFRAME_MS.get(timeframe)
-    duration_time_str = f"{duration_candles} x {timeframe} candles"
-
-    reason = (
-        f"range confirmed: {upper_tests} upper tests, {lower_tests} lower tests, "
-        f"width={width_percent:.2f}%, duration={duration_candles} candles, "
-        f"fully contained (buffer={CONTAINMENT_BUFFER_PCT}%), "
-        f"alternating touches ({touch_sequence}, {transition_count} transitions), "
-        f"dominance_ratio={dominance_ratio:.2f}, "
-        f"compression={compression if compression is not None else 'insufficient data'}"
-    )
-
-    return RangeResult(
-        detected=True,
-        reason=reason,
+    base_stats = dict(
         upper_boundary=upper_boundary,
         lower_boundary=lower_boundary,
         width_absolute=width_absolute,
         width_percent=width_percent,
-        duration_candles=duration_candles,
+        duration_candles=contained_duration,
         duration_time=duration_time_str,
         upper_tests=upper_tests,
         lower_tests=lower_tests,
@@ -840,7 +896,47 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
         directional_dominance_ratio=dominance_ratio,
         upper_touch_swings=[s for _, s in upper_cluster],
         lower_touch_swings=[s for _, s in lower_cluster],
+        lookback_candles_used=lookback_candles_used,
     )
+
+    if breach_index is None:
+        # ACTIVE RANGE: unbroken from genesis all the way to present.
+        reason = (
+            f"ACTIVE RANGE: {upper_tests} upper tests, {lower_tests} lower tests, "
+            f"width={width_percent:.2f}%, duration={contained_duration} candles, "
+            f"fully contained through present candle (buffer={CONTAINMENT_BUFFER_PCT}%), "
+            f"alternating touches ({touch_sequence}, {transition_count} transitions), "
+            f"dominance_ratio={dominance_ratio:.2f}, "
+            f"compression={compression if compression is not None else 'insufficient data'}"
+        )
+        return RangeResult(detected=True, status="ACTIVE", reason=reason, **base_stats)
+
+    candles_since_breach = present_index - breach_index
+
+    if candles_since_breach <= RECENT_BREAK_CANDLES:
+        reason = (
+            f"RECENTLY BROKEN RANGE: contained for {contained_duration} candles "
+            f"(genesis->breach), breached {candles_since_breach} candles ago "
+            f"(<= {RECENT_BREAK_CANDLES}), width={width_percent:.2f}%, "
+            f"{upper_tests} upper / {lower_tests} lower tests"
+        )
+        return RangeResult(
+            detected=False, status="RECENTLY_BROKEN", reason=reason,
+            breach_index=breach_index, candles_since_breach=candles_since_breach,
+            **base_stats,
+        )
+    else:
+        reason = (
+            f"HISTORICAL/EXPIRED RANGE: contained for {contained_duration} candles "
+            f"(genesis->breach), breached {candles_since_breach} candles ago "
+            f"(> {RECENT_BREAK_CANDLES}) — price has moved on, width={width_percent:.2f}%, "
+            f"{upper_tests} upper / {lower_tests} lower tests"
+        )
+        return RangeResult(
+            detected=False, status="EXPIRED", reason=reason,
+            breach_index=breach_index, candles_since_breach=candles_since_breach,
+            **base_stats,
+        )
 
 
 # ============================================================================
@@ -852,7 +948,9 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
 # boundary — buyers or sellers? It does NOT predict which way the range
 # will ultimately break, does NOT combine both boundaries into one
 # verdict, and is NEVER computed for a coin/timeframe where Phase 2A did
-# not confirm a range (there's nothing to evaluate readiness against).
+# not confirm an ACTIVE range (there's nothing to evaluate readiness
+# against — RECENTLY_BROKEN/EXPIRED ranges are informational only in v2,
+# not fed into Phase 2B).
 #
 # Per-boundary meaning:
 #   - Resistance (upper), buyers winning  -> BULLISH BREAKOUT IMMINENT
@@ -942,12 +1040,12 @@ def _evaluate_boundary_control(candles: List[Candle], touch_swings: List[SwingPo
 
 def compute_breakout_readiness(candles: List[Candle], range_result: RangeResult) -> BreakoutReadinessResult:
     """
-    Only ever computed for an ALREADY-CONFIRMED range (range_result.detected
-    == True). Reuses Phase 2A's exact touch swings — no re-fetching, no
-    re-clustering, no new candle data.
+    Only ever computed for an ACTIVE confirmed range (range_result.detected
+    == True, status == "ACTIVE"). Reuses Phase 2A's exact touch swings —
+    no re-fetching, no re-clustering, no new candle data.
     """
     if not range_result.detected:
-        return BreakoutReadinessResult(applicable=False, reason="no confirmed range detected")
+        return BreakoutReadinessResult(applicable=False, reason=f"no active confirmed range (status={range_result.status})")
 
     if not range_result.upper_touch_swings or not range_result.lower_touch_swings:
         return BreakoutReadinessResult(applicable=False, reason="range confirmed but touch data unavailable")
@@ -1187,16 +1285,22 @@ def build_diagnostics_text(results: List[MarketStateResult]) -> str:
 
 def build_range_report_text(results: List[MarketStateResult]) -> str:
     """
-    Phase 2A Range Detection diagnostic table, as required:
-    COIN | TF | MARKET STATE | RANGE DETECTED | UPPER | LOWER | WIDTH |
+    Phase 2A Range Detection v2 diagnostic table:
+    COIN | TF | MARKET STATE | STATUS | UPPER | LOWER | WIDTH |
     DURATION | UPPER TESTS | LOWER TESTS | POSITION | COMPRESSION | REASON
+
+    STATUS is the 4-way outcome: ACTIVE, RECENTLY_BROKEN, EXPIRED, NO_RANGE.
+    Boundary/width/duration/test/position/compression stats are shown for
+    ACTIVE, RECENTLY_BROKEN, and EXPIRED alike (a broken/expired range's
+    old boundaries and current price position relative to them are still
+    informative) — only NO_RANGE shows blank stats.
     """
     header = (
-        f"{'COIN':<6} {'TF':<5} {'STATE':<12} {'RANGE':<7} {'UPPER':<12} "
+        f"{'COIN':<6} {'TF':<5} {'STATE':<12} {'STATUS':<16} {'UPPER':<12} "
         f"{'LOWER':<12} {'WIDTH%':<8} {'DUR':<10} {'UTEST':<6} {'LTEST':<6} "
-        f"{'POS%':<8} {'COMPR':<8} REASON"
+        f"{'POS%':<8} {'COMPR':<8} {'SINCE':<7} REASON"
     )
-    lines = ["RANGE DETECTION (Phase 2A)", header, "-" * len(header)]
+    lines = ["RANGE DETECTION (Phase 2A v2 — bounded lookback)", header, "-" * len(header)]
 
     for r in results:
         if r.error:
@@ -1208,21 +1312,22 @@ def build_range_report_text(results: List[MarketStateResult]) -> str:
             lines.append(f"{r.symbol:<6} {r.timeframe:<5} {format_state(r):<12} (not computed)")
             continue
 
-        if not rr.detected:
+        if rr.status == "NO_RANGE":
             lines.append(
-                f"{r.symbol:<6} {r.timeframe:<5} {format_state(r):<12} {'NO':<7} "
+                f"{r.symbol:<6} {r.timeframe:<5} {format_state(r):<12} {'NO_RANGE':<16} "
                 f"{'-':<12} {'-':<12} {'-':<8} {'-':<10} {'-':<6} {'-':<6} "
-                f"{'-':<8} {'-':<8} {rr.reason}"
+                f"{'-':<8} {'-':<8} {'-':<7} {rr.reason}"
             )
             continue
 
         compr_str = "YES" if rr.compression is True else ("NO" if rr.compression is False else "N/A")
+        since_str = str(rr.candles_since_breach) if rr.candles_since_breach is not None else "-"
         lines.append(
-            f"{r.symbol:<6} {r.timeframe:<5} {format_state(r):<12} {'YES':<7} "
+            f"{r.symbol:<6} {r.timeframe:<5} {format_state(r):<12} {rr.status:<16} "
             f"{rr.upper_boundary:<12.6f} {rr.lower_boundary:<12.6f} "
             f"{rr.width_percent:<8.2f} {rr.duration_time:<10} "
             f"{rr.upper_tests:<6} {rr.lower_tests:<6} "
-            f"{rr.current_position_percent:<8.2f} {compr_str:<8} {rr.reason}"
+            f"{rr.current_position_percent:<8.2f} {compr_str:<8} {since_str:<7} {rr.reason}"
         )
 
     return "\n".join(lines)
