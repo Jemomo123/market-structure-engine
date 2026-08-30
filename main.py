@@ -1,3 +1,4 @@
+
 """
 Market State Detector — Phase 1 (single-file build)
 
@@ -906,7 +907,11 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
     if width_percent < MIN_RANGE_WIDTH_PCT:
         return RangeResult(
             detected=False, status="NO_RANGE",
-            reason="boundaries not sufficiently separated",
+            reason=(
+                f"boundaries not sufficiently separated "
+                f"(width={width_percent:.3f}% < required {MIN_RANGE_WIDTH_PCT}%)"
+            ),
+            width_percent=width_percent,
             lookback_candles_used=lookback_candles_used,
         )
 
@@ -1530,9 +1535,10 @@ def build_range_report_text(results: List[MarketStateResult]) -> str:
             continue
 
         if rr.status == "NO_RANGE":
+            width_str = f"{rr.width_percent:.3f}" if rr.width_percent is not None else "-"
             lines.append(
                 f"{r.symbol:<6} {r.timeframe:<5} {format_state(r):<12} {'NO_RANGE':<16} "
-                f"{'-':<12} {'-':<12} {'-':<8} {'-':<10} {'-':<6} {'-':<6} "
+                f"{'-':<12} {'-':<12} {width_str:<8} {'-':<10} {'-':<6} {'-':<6} "
                 f"{'-':<8} {'-':<8} {'-':<7} {rr.reason}"
             )
             continue
