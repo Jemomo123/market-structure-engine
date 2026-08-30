@@ -583,6 +583,23 @@ RANGE_LOOKBACK_CANDLES = 96
 # Initial estimate (~1/3 of MIN_RANGE_CANDLES) — not empirically tuned.
 RECENT_BREAK_CANDLES = 8
 
+# --- Generalized range shapes (v3, Sunday build) ---
+#
+# Generalizes "boundary" from a fixed price to a straight line through
+# 2+ confirmed touches. A flat boundary is just a line with ~zero slope
+# — the original flat-range logic becomes one special case of this,
+# not a separate code path. Two lines (upper, lower), each independently
+# flat/rising/falling, are looked up against a fixed table to name one
+# of 6 shapes (flat range, ascending/descending triangle, rising/falling
+# channel, symmetrical wedge). The 7th combination (diverging/expanding)
+# is explicitly excluded, matching the approved scope.
+
+# How close two slopes' PERCENTAGE difference needs to be to count as
+# "roughly parallel" (channel) rather than meaningfully different. Used
+# only to distinguish a channel (roughly constant width) from a
+# converging/diverging shape. Initial estimate, not tuned.
+PARALLEL_SLOPE_TOLERANCE_PCT = 50.0
+
 
 @dataclass(frozen=True)
 class RangeResult:
@@ -614,6 +631,14 @@ class RangeResult:
     breach_index: Optional[int] = None
     candles_since_breach: Optional[int] = None
     lookback_candles_used: Optional[int] = None
+    # v3: generalized shape fields
+    shape: str = "NO_RANGE"  # one of: FLAT_RANGE, ASCENDING_TRIANGLE,
+                              # DESCENDING_TRIANGLE, RISING_CHANNEL,
+                              # FALLING_CHANNEL, SYMMETRICAL_WEDGE, NO_RANGE
+    upper_slope_per_candle: Optional[float] = None
+    lower_slope_per_candle: Optional[float] = None
+    current_width_percent: Optional[float] = None  # width AT PRESENT (vs width_percent, which is width at genesis)
+    convergence_candles_ahead: Optional[int] = None  # only for converging shapes
 
 
 def _cluster_by_tolerance(prices_with_swings, tolerance_pct: float):
@@ -643,6 +668,91 @@ def _cluster_by_tolerance(prices_with_swings, tolerance_pct: float):
             clusters.append([(price, swing)])
 
     return clusters
+
+
+@dataclass(frozen=True)
+class _LineFit:
+    """A straight line through 2+ chronologically-ordered touches.
+    price_at(index) gives the line's interpolated/extrapolated value at
+    any candle index."""
+    touches: List[SwingPoint]  # chronologically ordered, all members
+
+    @property
+    def first(self) -> SwingPoint:
+        return self.touches[0]
+
+    @property
+    def last(self) -> SwingPoint:
+        return self.touches[-1]
+
+    @property
+    def slope_per_candle(self) -> float:
+        span = self.last.index - self.first.index
+        if span == 0:
+            return 0.0
+        return (self.last.price - self.first.price) / span
+
+    def price_at(self, index: int) -> float:
+        return self.first.price + self.slope_per_candle * (index - self.first.index)
+
+
+def _fit_line_clusters(touches_with_swings, tolerance_pct: float) -> List[_LineFit]:
+    """
+    Generalizes _cluster_by_tolerance from "cluster by price" to "cluster
+    by consistency with a straight line". Touches are processed in
+    CHRONOLOGICAL order (not sorted by price). A touch joins the current
+    line if its actual price is within tolerance_pct of the line's
+    PREDICTED value at that touch's index (predicted via the line's
+    current first/last anchor points) — else it starts a new line.
+
+    When all touches in a resulting line happen to sit at nearly the
+    same price, the fitted line's slope comes out ~0 — this is how a
+    flat boundary emerges as a special case of the same mechanism,
+    rather than needing separate logic.
+
+    touches_with_swings: list of (price, SwingPoint) tuples, any order.
+    Returns a list of _LineFit, each covering a chronologically
+    contiguous run of consistent touches.
+    """
+    if not touches_with_swings:
+        return []
+
+    ordered = sorted((s for _, s in touches_with_swings), key=lambda s: s.index)
+
+    lines: List[List[SwingPoint]] = [[ordered[0]]]
+
+    for swing in ordered[1:]:
+        current = lines[-1]
+        if len(current) == 1:
+            # Second point always joins — a single point has no slope to
+            # test consistency against yet.
+            current.append(swing)
+            continue
+
+        anchor_first = current[0]
+        anchor_last = current[-1]
+        span = anchor_last.index - anchor_first.index
+        slope = (anchor_last.price - anchor_first.price) / span if span != 0 else 0.0
+        predicted = anchor_first.price + slope * (swing.index - anchor_first.index)
+
+        tolerance = predicted * (tolerance_pct / 100.0) if predicted > 0 else 0.0
+        if abs(swing.price - predicted) <= abs(tolerance):
+            current.append(swing)
+        else:
+            lines.append([swing])
+
+    return [_LineFit(touches=line) for line in lines]
+
+
+def _line_total_drift_pct(line: _LineFit) -> float:
+    """Total price change from the line's first to last touch, as a
+    percentage of the first touch's price. Used to classify a line as
+    flat vs sloped using the SAME tolerance already used for clustering
+    — a flat line is simply one whose own total drift stays within that
+    tolerance."""
+    if line.first.price == 0:
+        return 0.0
+    return abs(line.last.price - line.first.price) / line.first.price * 100.0
 
 
 def _detect_compression(candles: List[Candle], start_index: int, end_index: Optional[int] = None) -> Optional[bool]:
@@ -711,17 +821,21 @@ def _check_alternation(upper_cluster, lower_cluster):
 
 def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str) -> RangeResult:
     """
-    Phase 2A Range Detection v2 — bounded lookback, breach-classified.
+    Phase 2A Range Detection v3 — generalized shapes via line-fitting.
 
     Consumes SSOT1's already-computed closed candles and confirmed swings
     only — no fetching, no re-validation of candle data, no look-ahead.
 
-    v2 correction (post 5x live-failure review): boundary candidates are
-    now searched ONLY within the most recent RANGE_LOOKBACK_CANDLES
-    closed candles — an ancient touch can never pair with a recent one.
-    Containment is scanned forward from genesis and classified by WHEN
-    (if ever) a breach occurred, rather than blanket-rejecting any
-    candidate that doesn't survive unbroken all the way to the present.
+    v3: a boundary is now a straight line through 2+ confirmed touches
+    (a flat boundary is just a line with ~zero slope — the original flat
+    range becomes one special case of this, not separate logic). Each
+    side is independently classified flat/rising/falling; the pair is
+    looked up against a fixed table to name one of 6 supported shapes.
+    The 7th combination (diverging/expanding) is explicitly excluded.
+    Bounded lookback and breach-classification (ACTIVE/RECENTLY_BROKEN/
+    EXPIRED/NO_RANGE) from v2 are preserved unchanged in mechanism, now
+    operating against each candle's LINE-implied boundary value at that
+    candle's own index instead of one fixed number.
     """
     total_candles = len(candles)
     lookback_start_index = max(0, total_candles - RANGE_LOOKBACK_CANDLES)
@@ -739,48 +853,55 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
             lookback_candles_used=lookback_candles_used,
         )
 
-    high_clusters = _cluster_by_tolerance(swing_highs, BOUNDARY_TOLERANCE_PCT)
-    low_clusters = _cluster_by_tolerance(swing_lows, BOUNDARY_TOLERANCE_PCT)
+    upper_lines = _fit_line_clusters(swing_highs, BOUNDARY_TOLERANCE_PCT)
+    lower_lines = _fit_line_clusters(swing_lows, BOUNDARY_TOLERANCE_PCT)
 
-    qualifying_high_clusters = [c for c in high_clusters if len(c) >= MIN_BOUNDARY_TESTS]
-    qualifying_low_clusters = [c for c in low_clusters if len(c) >= MIN_BOUNDARY_TESTS]
+    qualifying_upper_lines = [l for l in upper_lines if len(l.touches) >= MIN_BOUNDARY_TESTS]
+    qualifying_lower_lines = [l for l in lower_lines if len(l.touches) >= MIN_BOUNDARY_TESTS]
 
-    if not qualifying_high_clusters and not qualifying_low_clusters:
+    if not qualifying_upper_lines and not qualifying_lower_lines:
         return RangeResult(
             detected=False, status="NO_RANGE",
             reason=f"insufficient boundary tests on both sides within lookback (last {lookback_candles_used} candles)",
             lookback_candles_used=lookback_candles_used,
         )
-    if not qualifying_high_clusters:
+    if not qualifying_upper_lines:
         return RangeResult(
             detected=False, status="NO_RANGE",
             reason=f"insufficient boundary tests on upper side within lookback (last {lookback_candles_used} candles)",
             lookback_candles_used=lookback_candles_used,
         )
-    if not qualifying_low_clusters:
+    if not qualifying_lower_lines:
         return RangeResult(
             detected=False, status="NO_RANGE",
             reason=f"insufficient boundary tests on lower side within lookback (last {lookback_candles_used} candles)",
             lookback_candles_used=lookback_candles_used,
         )
 
-    upper_cluster = max(qualifying_high_clusters, key=lambda c: c[0][0])
-    lower_cluster = min(qualifying_low_clusters, key=lambda c: c[0][0])
+    # Pick the most recent qualifying line on each side (most relevant to
+    # "now"), tie-broken by most touches.
+    upper_line = max(qualifying_upper_lines, key=lambda l: (l.last.index, len(l.touches)))
+    lower_line = max(qualifying_lower_lines, key=lambda l: (l.last.index, len(l.touches)))
 
-    upper_boundary = sum(p for p, _ in upper_cluster) / len(upper_cluster)
-    lower_boundary = sum(p for p, _ in lower_cluster) / len(lower_cluster)
-    upper_tests = len(upper_cluster)
-    lower_tests = len(lower_cluster)
+    upper_tests = len(upper_line.touches)
+    lower_tests = len(lower_line.touches)
 
-    if upper_boundary <= lower_boundary:
+    all_boundary_swings = list(upper_line.touches) + list(lower_line.touches)
+    genesis_index = min(s.index for s in all_boundary_swings)
+    last_touch_index = max(s.index for s in all_boundary_swings)
+
+    upper_at_genesis = upper_line.price_at(genesis_index)
+    lower_at_genesis = lower_line.price_at(genesis_index)
+
+    if upper_at_genesis <= lower_at_genesis:
         return RangeResult(
             detected=False, status="NO_RANGE",
-            reason="no coherent boundary clusters",
+            reason="no coherent boundary clusters (lines cross at genesis)",
             lookback_candles_used=lookback_candles_used,
         )
 
-    width_absolute = upper_boundary - lower_boundary
-    width_percent = (width_absolute / lower_boundary) * 100.0
+    width_absolute = upper_at_genesis - lower_at_genesis
+    width_percent = (width_absolute / lower_at_genesis) * 100.0
 
     if width_percent < MIN_RANGE_WIDTH_PCT:
         return RangeResult(
@@ -789,9 +910,11 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
             lookback_candles_used=lookback_candles_used,
         )
 
-    # Alternation check — UNCHANGED mechanic, now operating on
-    # lookback-scoped touches only.
-    fully_alternating, transition_count, touch_sequence = _check_alternation(upper_cluster, lower_cluster)
+    # Alternation check — UNCHANGED mechanic, now over each line's
+    # member touches instead of a fixed-price cluster's members.
+    upper_cluster_pairs = [(s.price, s) for s in upper_line.touches]
+    lower_cluster_pairs = [(s.price, s) for s in lower_line.touches]
+    fully_alternating, transition_count, touch_sequence = _check_alternation(upper_cluster_pairs, lower_cluster_pairs)
 
     if not fully_alternating:
         return RangeResult(
@@ -807,13 +930,6 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
             boundary_touch_sequence=touch_sequence,
             lookback_candles_used=lookback_candles_used,
         )
-
-    # Genesis: earliest (by candle index) among every swing that belongs
-    # to either qualifying cluster. This is where the candidate's life
-    # begins — nothing before this point is considered.
-    all_boundary_swings = [s for _, s in upper_cluster] + [s for _, s in lower_cluster]
-    genesis_index = min(s.index for s in all_boundary_swings)
-    last_touch_index = max(s.index for s in all_boundary_swings)
 
     # Directional-dominance check — UNCHANGED mechanic.
     span_swings = [s for s in swings if genesis_index <= s.index <= last_touch_index]
@@ -842,15 +958,84 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
             lookback_candles_used=lookback_candles_used,
         )
 
-    # --- NEW: forward breach scan from genesis, classify by WHEN (if
-    # ever) containment first broke, instead of blanket-rejecting any
-    # candidate that doesn't survive unbroken all the way to present. ---
-    upper_limit = upper_boundary * (1 + CONTAINMENT_BUFFER_PCT / 100.0)
-    lower_limit = lower_boundary * (1 - CONTAINMENT_BUFFER_PCT / 100.0)
+    # --- Shape classification ---
+    upper_drift_pct = _line_total_drift_pct(upper_line)
+    lower_drift_pct = _line_total_drift_pct(lower_line)
+    upper_is_flat = upper_drift_pct <= BOUNDARY_TOLERANCE_PCT
+    lower_is_flat = lower_drift_pct <= BOUNDARY_TOLERANCE_PCT
 
+    def _direction(line, is_flat):
+        if is_flat:
+            return "flat"
+        return "rising" if line.slope_per_candle > 0 else "falling"
+
+    upper_dir = _direction(upper_line, upper_is_flat)
+    lower_dir = _direction(lower_line, lower_is_flat)
+
+    def _slopes_roughly_parallel(line_a, line_b):
+        a, b = line_a.slope_per_candle, line_b.slope_per_candle
+        if a == 0 or b == 0:
+            return False
+        if (a > 0) != (b > 0):
+            return False
+        larger, smaller = max(abs(a), abs(b)), min(abs(a), abs(b))
+        if larger == 0:
+            return False
+        diff_pct = (1 - smaller / larger) * 100.0
+        return diff_pct <= PARALLEL_SLOPE_TOLERANCE_PCT
+
+    upper_at_present_preview = upper_line.price_at(total_candles - 1)
+    lower_at_present_preview = lower_line.price_at(total_candles - 1)
+    width_at_present_preview = upper_at_present_preview - lower_at_present_preview
+    is_narrowing = width_at_present_preview < width_absolute
+
+    shape = None
+    if upper_dir == "flat" and lower_dir == "flat":
+        shape = "FLAT_RANGE"
+    elif upper_dir == "flat" and lower_dir == "rising":
+        shape = "ASCENDING_TRIANGLE"
+    elif upper_dir == "falling" and lower_dir == "flat":
+        shape = "DESCENDING_TRIANGLE"
+    elif upper_dir == "rising" and lower_dir == "rising":
+        shape = "RISING_CHANNEL" if _slopes_roughly_parallel(upper_line, lower_line) else None
+    elif upper_dir == "falling" and lower_dir == "falling":
+        shape = "FALLING_CHANNEL" if _slopes_roughly_parallel(upper_line, lower_line) else None
+    elif upper_dir == "falling" and lower_dir == "rising":
+        shape = "SYMMETRICAL_WEDGE" if is_narrowing else None
+    elif upper_dir == "rising" and lower_dir == "falling":
+        shape = None  # Type 7 (expanding/diverging) — explicitly excluded
+    else:
+        # (flat, falling) or (rising, flat) — one-sided WIDENING shapes,
+        # not in the approved 6-shape set.
+        shape = None
+
+    if shape is None:
+        return RangeResult(
+            detected=False, status="NO_RANGE",
+            reason=(
+                f"unsupported or inconsistent shape (upper={upper_dir}, lower={lower_dir}) — "
+                f"either a widening/diverging pattern (excluded) or slopes too dissimilar to be a channel"
+            ),
+            boundary_touch_sequence=touch_sequence,
+            directional_dominance_ratio=dominance_ratio,
+            lookback_candles_used=lookback_candles_used,
+        )
+
+    # --- Forward breach scan from genesis, against each candle's
+    # LINE-implied boundary value at that candle's own index. A
+    # converging shape's lines crossing each other (even before the
+    # buffer is applied) is ALSO a breach — the range has geometrically
+    # run out of room, not just been pierced by a wick. ---
     breach_index = None
     for idx in range(genesis_index, total_candles):
         c = candles[idx]
+        upper_val = upper_line.price_at(idx)
+        lower_val = lower_line.price_at(idx)
+        if upper_val <= lower_val:
+            breach_index = idx
+            break
+        upper_limit = upper_val * (1 + CONTAINMENT_BUFFER_PCT / 100.0)
+        lower_limit = lower_val * (1 - CONTAINMENT_BUFFER_PCT / 100.0)
         if c.high > upper_limit or c.low < lower_limit:
             breach_index = idx
             break
@@ -874,15 +1059,40 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
     compression = _detect_compression(candles, genesis_index, contained_end_index + 1)
     duration_time_str = f"{contained_duration} x {timeframe} candles"
 
-    # current_price / position are always reported relative to the
-    # boundaries — even for EXPIRED/RECENTLY_BROKEN, this tells us where
-    # price sits NOW relative to the old range, which is informative.
+    # current_price / position are reported relative to each line's value
+    # AT THE PRESENT candle — for a sloped boundary this is the trendline's
+    # current level, not its old genesis-time level.
     current_price = candles[-1].close
-    current_position_percent = ((current_price - lower_boundary) / width_absolute) * 100.0
+    upper_at_present = upper_line.price_at(present_index)
+    lower_at_present = lower_line.price_at(present_index)
+    width_at_present = upper_at_present - lower_at_present
+    current_width_percent = (width_at_present / lower_at_present * 100.0) if lower_at_present > 0 else None
+    current_position_percent = (
+        ((current_price - lower_at_present) / width_at_present) * 100.0
+        if width_at_present > 0 else None
+    )
+
+    # Convergence estimate (only meaningful for converging shapes: the
+    # two triangle types and the wedge). Solve upper_line.price_at(idx)
+    # == lower_line.price_at(idx) algebraically.
+    convergence_candles_ahead = None
+    if shape in ("ASCENDING_TRIANGLE", "DESCENDING_TRIANGLE", "SYMMETRICAL_WEDGE"):
+        slope_diff = lower_line.slope_per_candle - upper_line.slope_per_candle
+        if slope_diff != 0:
+            # upper.first.price + upper.slope*(x - upper.first.index) == lower.first.price + lower.slope*(x - lower.first.index)
+            # Solve for x:
+            numerator = (
+                upper_line.first.price - upper_line.slope_per_candle * upper_line.first.index
+                - lower_line.first.price + lower_line.slope_per_candle * lower_line.first.index
+            )
+            x_convergence = numerator / slope_diff
+            candles_ahead = x_convergence - present_index
+            if candles_ahead > 0:
+                convergence_candles_ahead = int(round(candles_ahead))
 
     base_stats = dict(
-        upper_boundary=upper_boundary,
-        lower_boundary=lower_boundary,
+        upper_boundary=upper_at_present,
+        lower_boundary=lower_at_present,
         width_absolute=width_absolute,
         width_percent=width_percent,
         duration_candles=contained_duration,
@@ -894,19 +1104,26 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
         compression=compression,
         boundary_touch_sequence=touch_sequence,
         directional_dominance_ratio=dominance_ratio,
-        upper_touch_swings=[s for _, s in upper_cluster],
-        lower_touch_swings=[s for _, s in lower_cluster],
+        upper_touch_swings=list(upper_line.touches),
+        lower_touch_swings=list(lower_line.touches),
         lookback_candles_used=lookback_candles_used,
+        shape=shape,
+        upper_slope_per_candle=upper_line.slope_per_candle,
+        lower_slope_per_candle=lower_line.slope_per_candle,
+        current_width_percent=current_width_percent,
+        convergence_candles_ahead=convergence_candles_ahead,
     )
 
     if breach_index is None:
-        # ACTIVE RANGE: unbroken from genesis all the way to present.
+        current_width_str = f"{current_width_percent:.2f}%" if current_width_percent is not None else "n/a"
         reason = (
-            f"ACTIVE RANGE: {upper_tests} upper tests, {lower_tests} lower tests, "
-            f"width={width_percent:.2f}%, duration={contained_duration} candles, "
+            f"ACTIVE {shape}: {upper_tests} upper tests, {lower_tests} lower tests, "
+            f"width@genesis={width_percent:.2f}%, width@now={current_width_str}, "
+            f"duration={contained_duration} candles, "
             f"fully contained through present candle (buffer={CONTAINMENT_BUFFER_PCT}%), "
             f"alternating touches ({touch_sequence}, {transition_count} transitions), "
             f"dominance_ratio={dominance_ratio:.2f}, "
+            f"upper_slope={upper_line.slope_per_candle:.6g}/candle, lower_slope={lower_line.slope_per_candle:.6g}/candle, "
             f"compression={compression if compression is not None else 'insufficient data'}"
         )
         return RangeResult(detected=True, status="ACTIVE", reason=reason, **base_stats)
@@ -915,9 +1132,9 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
 
     if candles_since_breach <= RECENT_BREAK_CANDLES:
         reason = (
-            f"RECENTLY BROKEN RANGE: contained for {contained_duration} candles "
+            f"RECENTLY BROKEN {shape}: contained for {contained_duration} candles "
             f"(genesis->breach), breached {candles_since_breach} candles ago "
-            f"(<= {RECENT_BREAK_CANDLES}), width={width_percent:.2f}%, "
+            f"(<= {RECENT_BREAK_CANDLES}), width@genesis={width_percent:.2f}%, "
             f"{upper_tests} upper / {lower_tests} lower tests"
         )
         return RangeResult(
@@ -927,9 +1144,9 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
         )
     else:
         reason = (
-            f"HISTORICAL/EXPIRED RANGE: contained for {contained_duration} candles "
+            f"HISTORICAL/EXPIRED {shape}: contained for {contained_duration} candles "
             f"(genesis->breach), breached {candles_since_breach} candles ago "
-            f"(> {RECENT_BREAK_CANDLES}) — price has moved on, width={width_percent:.2f}%, "
+            f"(> {RECENT_BREAK_CANDLES}) — price has moved on, width@genesis={width_percent:.2f}%, "
             f"{upper_tests} upper / {lower_tests} lower tests"
         )
         return RangeResult(
@@ -1322,12 +1539,13 @@ def build_range_report_text(results: List[MarketStateResult]) -> str:
 
         compr_str = "YES" if rr.compression is True else ("NO" if rr.compression is False else "N/A")
         since_str = str(rr.candles_since_breach) if rr.candles_since_breach is not None else "-"
+        pos_str = f"{rr.current_position_percent:.2f}" if rr.current_position_percent is not None else "-"
         lines.append(
             f"{r.symbol:<6} {r.timeframe:<5} {format_state(r):<12} {rr.status:<16} "
             f"{rr.upper_boundary:<12.6f} {rr.lower_boundary:<12.6f} "
             f"{rr.width_percent:<8.2f} {rr.duration_time:<10} "
             f"{rr.upper_tests:<6} {rr.lower_tests:<6} "
-            f"{rr.current_position_percent:<8.2f} {compr_str:<8} {since_str:<7} {rr.reason}"
+            f"{pos_str:<8} {compr_str:<8} {since_str:<7} {rr.reason}"
         )
 
     return "\n".join(lines)
