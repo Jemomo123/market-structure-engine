@@ -1,4 +1,3 @@
-
 """
 Market State Detector — Phase 1 (single-file build)
 
@@ -515,10 +514,23 @@ CONTAINMENT_BUFFER_PCT = 0.10
 # confirmed swings in its cluster to count as established.
 MIN_BOUNDARY_TESTS = 2
 
-# Upper and lower boundaries must be separated by at least this
-# percentage (relative to the lower boundary) to count as a real range
-# rather than noise.
-MIN_RANGE_WIDTH_PCT = 0.50
+# --- Adaptive width threshold (replaces the old fixed MIN_RANGE_WIDTH_PCT) ---
+#
+# A single fixed percentage treats every coin the same, which doesn't
+# make sense: what counts as "meaningfully separated" should scale with
+# how much that specific coin/timeframe normally moves. Instead of one
+# flat number, the required minimum width is now derived from that
+# coin's own typical candle range (high-low as % of price) over the
+# lookback window, then clamped to a floor/ceiling band.
+
+# The required width is this many multiples of the coin's own average
+# candle range (as a %). Initial estimate, not tuned.
+MIN_RANGE_WIDTH_MULTIPLIER = 2.0
+
+# The adaptive threshold is never allowed to go below/above these
+# bounds, regardless of the coin's own volatility.
+MIN_RANGE_WIDTH_FLOOR_PCT = 0.30
+MIN_RANGE_WIDTH_CEILING_PCT = 0.50
 
 # Minimum number of the timeframe's OWN closed candles the range must
 # span (24 on 5m = 24 five-minute candles; 24 on 1h = 24 one-hour
@@ -756,6 +768,33 @@ def _line_total_drift_pct(line: _LineFit) -> float:
     return abs(line.last.price - line.first.price) / line.first.price * 100.0
 
 
+def _compute_adaptive_min_width_pct(candles: List[Candle], lookback_start_index: int) -> float:
+    """
+    Derives the required minimum boundary separation from this specific
+    coin/timeframe's own typical candle range, rather than one fixed
+    number for every coin. Pure candle geometry (high-low as % of
+    price), no indicators.
+
+    avg_candle_range_pct = average of (high-low)/close*100 across the
+    lookback window. Required width = MIN_RANGE_WIDTH_MULTIPLIER times
+    that, clamped to [MIN_RANGE_WIDTH_FLOOR_PCT, MIN_RANGE_WIDTH_CEILING_PCT].
+    """
+    span = candles[lookback_start_index:]
+    if not span:
+        return MIN_RANGE_WIDTH_FLOOR_PCT
+
+    ranges_pct = [
+        ((c.high - c.low) / c.close * 100.0)
+        for c in span if c.close > 0
+    ]
+    if not ranges_pct:
+        return MIN_RANGE_WIDTH_FLOOR_PCT
+
+    avg_candle_range_pct = sum(ranges_pct) / len(ranges_pct)
+    required = avg_candle_range_pct * MIN_RANGE_WIDTH_MULTIPLIER
+    return max(MIN_RANGE_WIDTH_FLOOR_PCT, min(MIN_RANGE_WIDTH_CEILING_PCT, required))
+
+
 def _detect_compression(candles: List[Candle], start_index: int, end_index: Optional[int] = None) -> Optional[bool]:
     """
     Splits candles[start_index:end_index] (end_index exclusive; defaults
@@ -904,12 +943,15 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
     width_absolute = upper_at_genesis - lower_at_genesis
     width_percent = (width_absolute / lower_at_genesis) * 100.0
 
-    if width_percent < MIN_RANGE_WIDTH_PCT:
+    required_width_pct = _compute_adaptive_min_width_pct(candles, lookback_start_index)
+
+    if width_percent < required_width_pct:
         return RangeResult(
             detected=False, status="NO_RANGE",
             reason=(
                 f"boundaries not sufficiently separated "
-                f"(width={width_percent:.3f}% < required {MIN_RANGE_WIDTH_PCT}%)"
+                f"(width={width_percent:.3f}% < required {required_width_pct:.3f}% "
+                f"[adaptive, coin's own volatility, clamped {MIN_RANGE_WIDTH_FLOOR_PCT}-{MIN_RANGE_WIDTH_CEILING_PCT}%])"
             ),
             width_percent=width_percent,
             lookback_candles_used=lookback_candles_used,
