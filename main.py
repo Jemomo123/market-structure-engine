@@ -532,10 +532,36 @@ MIN_RANGE_WIDTH_MULTIPLIER = 2.0
 MIN_RANGE_WIDTH_FLOOR_PCT = 0.30
 MIN_RANGE_WIDTH_CEILING_PCT = 0.50
 
-# Minimum number of the timeframe's OWN closed candles the range must
-# span (24 on 5m = 24 five-minute candles; 24 on 1h = 24 one-hour
-# candles — never converted to a fixed wall-clock duration).
-MIN_RANGE_CANDLES = 24
+# Minimum number of closed candles a range must span before it's
+# considered established, and how far back to search for boundary
+# candidates in the first place. BOTH are now per-timeframe, not one
+# flat candle-count for all three — a flat number means wildly
+# different real time depending on the timeframe (24 candles = 2 hours
+# on 5m but 1 day on 1h), which doesn't reflect how long a genuine
+# range realistically takes to form on each. These are starting points
+# to test against real data, not final/optimized values.
+MIN_RANGE_CANDLES_BY_TF = {
+    "5m": 10,   # ~50 minutes
+    "15m": 14,  # ~3.5 hours
+    "1h": 21,   # ~21 hours
+}
+RANGE_LOOKBACK_CANDLES_BY_TF = {
+    "5m": 48,    # ~4 hours
+    "15m": 96,   # ~24 hours
+    "1h": 108,   # ~4.5 days
+}
+# Fallback if an unrecognized timeframe string is ever passed in.
+_DEFAULT_MIN_RANGE_CANDLES = 24
+_DEFAULT_RANGE_LOOKBACK_CANDLES = 96
+
+
+def _min_range_candles_for(timeframe: str) -> int:
+    return MIN_RANGE_CANDLES_BY_TF.get(timeframe, _DEFAULT_MIN_RANGE_CANDLES)
+
+
+def _range_lookback_candles_for(timeframe: str) -> int:
+    return RANGE_LOOKBACK_CANDLES_BY_TF.get(timeframe, _DEFAULT_RANGE_LOOKBACK_CANDLES)
+
 
 # Compression check: the recent portion of the range's high-low envelope
 # must be at least this percentage narrower than the earlier portion's
@@ -583,17 +609,13 @@ MAX_DIRECTIONAL_DOMINANCE_RATIO = 0.50
 # afterward. Fix: bound the candidate search to a recent window, and
 # classify (rather than blanket-reject) whatever happened after a range's
 # contained life ends.
-
-# Only swings within this many most-recent closed candles are eligible to
-# form boundary candidates. An ancient touch can never pair with a recent
-# one — they're no longer in the same search universe at all. Initial
-# estimate (4x MIN_RANGE_CANDLES, giving room for a minimum-length range
-# to form AND still be observable afterward) — not empirically tuned.
-RANGE_LOOKBACK_CANDLES = 96
+#
+# NOTE: the lookback window is now per-timeframe — see
+# RANGE_LOOKBACK_CANDLES_BY_TF above — rather than one flat number.
 
 # How many candles ago a boundary breach must have occurred to still
 # count as "recent" rather than "the market has moved on a while ago".
-# Initial estimate (~1/3 of MIN_RANGE_CANDLES) — not empirically tuned.
+# Initial estimate (~1/3 of a typical MIN_RANGE_CANDLES) — not empirically tuned.
 RECENT_BREAK_CANDLES = 8
 
 # --- Generalized range shapes (v3, Sunday build) ---
@@ -635,11 +657,18 @@ class RangeResult:
     boundary_touch_sequence: Optional[str] = None
     directional_dominance_ratio: Optional[float] = None
     # Raw touch swings, populated only for ACTIVE/RECENTLY_BROKEN/EXPIRED
-    # (i.e. whenever a genuine candidate was found), so Phase 2B can reuse
-    # the EXACT same boundary-defining touches without recomputing
-    # clustering.
+    # (i.e. whenever a genuine candidate was found). Index-based — only
+    # valid against the SAME candles list this RangeResult was computed
+    # from. Kept for diagnostics/backward compatibility.
     upper_touch_swings: Optional[List[SwingPoint]] = None
     lower_touch_swings: Optional[List[SwingPoint]] = None
+    # Self-contained snapshots of the actual touch candles (full OHLC),
+    # NOT index-dependent — safe to reuse across scans (e.g. for a
+    # persisted/continuing range, whose touches come from an older
+    # candles list where the indices no longer mean anything). Phase 2B
+    # reads these, not the index-based swings above.
+    upper_touch_candles: Optional[List[Candle]] = None
+    lower_touch_candles: Optional[List[Candle]] = None
     # New in v2: breach diagnostics
     breach_index: Optional[int] = None
     candles_since_breach: Optional[int] = None
@@ -652,6 +681,10 @@ class RangeResult:
     lower_slope_per_candle: Optional[float] = None
     current_width_percent: Optional[float] = None  # width AT PRESENT (vs width_percent, which is width at genesis)
     convergence_candles_ahead: Optional[int] = None  # only for converging shapes
+    # v4: persistence
+    from_persisted: bool = False  # True when this ACTIVE result came from
+                                    # validating a PRIOR scan's confirmed
+                                    # range, rather than a fresh search.
 
 
 def _cluster_by_tolerance(prices_with_swings, tolerance_pct: float):
@@ -859,6 +892,184 @@ def _check_alternation(upper_cluster, lower_cluster):
     return fully_alternating, transition_count, sequence_str
 
 
+# ============================================================================
+# PERSISTENCE — v4: memory between scans
+# ============================================================================
+#
+# The root problem this fixes: every scan used to re-derive everything
+# from scratch. A range that was still genuinely intact could vanish
+# from the results simply because a fresh search happened to land on a
+# DIFFERENT valid-looking pair of touches than last time — not because
+# anything actually broke. Fix: once a range is confirmed ACTIVE,
+# remember its exact boundary lines. On the next scan, check FIRST
+# whether those same lines still hold against the newest candles before
+# ever running a fresh search. Only fall through to a fresh search when
+# the persisted range is actually proven broken.
+#
+# Keyed by (symbol, timeframe). Lives in-process for as long as the
+# service runs — resets on redeploy/restart, which is an accepted,
+# known limitation (no external storage added).
+_persisted_ranges: dict = {}
+
+
+def _line_value_at_timestamp(first_ts: int, first_price: float, last_ts: int, last_price: float, ts: int) -> float:
+    """Same linear interpolation/extrapolation as _LineFit.price_at, but
+    keyed by real timestamp instead of candle index — necessary because
+    candle INDEX positions are only comparable within a single scan's
+    fetch (the fetch window slides forward in time every scan), while
+    TIMESTAMPS are real wall-clock values, stable and comparable across
+    every scan regardless of how the fetch window has shifted."""
+    span = last_ts - first_ts
+    if span == 0:
+        return first_price
+    slope_per_ms = (last_price - first_price) / span
+    return first_price + slope_per_ms * (ts - first_ts)
+
+
+def _validate_persisted_range(candles: List[Candle], persisted: dict) -> Optional[dict]:
+    """
+    Checks whether a previously-confirmed ACTIVE range still holds,
+    using ONLY the candles newer than the last time it was verified
+    (persisted["last_verified_ts"]) — not a full re-scan back to
+    genesis, since everything up to the last verification was already
+    proven clean in a prior pass.
+
+    Returns an updated persisted dict if it still holds, or None if a
+    breach was found (the range is dead — caller should fall through to
+    a fresh search).
+    """
+    new_candles = [c for c in candles if c.timestamp > persisted["last_verified_ts"]]
+    if not new_candles:
+        # No new closed candles since last check — nothing to validate,
+        # still holds exactly as it was.
+        return persisted
+
+    for c in new_candles:
+        upper_val = _line_value_at_timestamp(
+            persisted["upper_first_ts"], persisted["upper_first_price"],
+            persisted["upper_last_ts"], persisted["upper_last_price"], c.timestamp,
+        )
+        lower_val = _line_value_at_timestamp(
+            persisted["lower_first_ts"], persisted["lower_first_price"],
+            persisted["lower_last_ts"], persisted["lower_last_price"], c.timestamp,
+        )
+        if upper_val <= lower_val:
+            return None  # lines have crossed — geometrically dead
+        upper_limit = upper_val * (1 + CONTAINMENT_BUFFER_PCT / 100.0)
+        lower_limit = lower_val * (1 - CONTAINMENT_BUFFER_PCT / 100.0)
+        if c.high > upper_limit or c.low < lower_limit:
+            return None  # genuine breach
+
+    updated = dict(persisted)
+    updated["last_verified_ts"] = new_candles[-1].timestamp
+    updated["duration_candles"] = persisted["duration_candles"] + len(new_candles)
+    updated["current_price"] = new_candles[-1].close
+    return updated
+
+
+def _persisted_to_range_result(persisted: dict, timeframe: str) -> RangeResult:
+    """Builds a RangeResult reflecting a continuing (still-valid)
+    persisted range — same boundaries/shape as when first confirmed,
+    updated duration and current price/position."""
+    upper_now = _line_value_at_timestamp(
+        persisted["upper_first_ts"], persisted["upper_first_price"],
+        persisted["upper_last_ts"], persisted["upper_last_price"], persisted["last_verified_ts"],
+    )
+    lower_now = _line_value_at_timestamp(
+        persisted["lower_first_ts"], persisted["lower_first_price"],
+        persisted["lower_last_ts"], persisted["lower_last_price"], persisted["last_verified_ts"],
+    )
+    width_now = upper_now - lower_now
+    current_price = persisted["current_price"]
+    current_position_percent = ((current_price - lower_now) / width_now * 100.0) if width_now > 0 else None
+    current_width_percent = (width_now / lower_now * 100.0) if lower_now > 0 else None
+
+    reason = (
+        f"ACTIVE {persisted['shape']} (persisted, continuing): "
+        f"{persisted['upper_tests']} upper tests, {persisted['lower_tests']} lower tests, "
+        f"duration={persisted['duration_candles']} candles, "
+        f"still fully contained since last verified — no fresh search needed"
+    )
+
+    return RangeResult(
+        detected=True, status="ACTIVE", reason=reason,
+        upper_boundary=upper_now, lower_boundary=lower_now,
+        width_absolute=width_now, width_percent=persisted["width_percent_at_genesis"],
+        duration_candles=persisted["duration_candles"],
+        duration_time=f"{persisted['duration_candles']} x {timeframe} candles",
+        upper_tests=persisted["upper_tests"], lower_tests=persisted["lower_tests"],
+        current_price=current_price, current_position_percent=current_position_percent,
+        compression=persisted.get("compression"),
+        boundary_touch_sequence=persisted.get("boundary_touch_sequence"),
+        directional_dominance_ratio=persisted.get("dominance_ratio"),
+        upper_touch_candles=persisted["upper_touch_candles"],
+        lower_touch_candles=persisted["lower_touch_candles"],
+        lookback_candles_used=persisted.get("lookback_candles_used"),
+        shape=persisted["shape"],
+        upper_slope_per_candle=persisted["upper_slope_per_candle"],
+        lower_slope_per_candle=persisted["lower_slope_per_candle"],
+        current_width_percent=current_width_percent,
+        convergence_candles_ahead=None,  # not recomputed for a continuing range
+        from_persisted=True,
+    )
+
+
+def _snapshot_range_for_persistence(range_result: RangeResult) -> dict:
+    """Captures everything needed to validate this ACTIVE range on
+    future scans WITHOUT needing the original candles/swings lists
+    again — timestamps and prices only, all self-contained."""
+    upper_touches = range_result.upper_touch_candles
+    lower_touches = range_result.lower_touch_candles
+    return {
+        "upper_first_ts": upper_touches[0].timestamp, "upper_first_price": upper_touches[0].high,
+        "upper_last_ts": upper_touches[-1].timestamp, "upper_last_price": upper_touches[-1].high,
+        "lower_first_ts": lower_touches[0].timestamp, "lower_first_price": lower_touches[0].low,
+        "lower_last_ts": lower_touches[-1].timestamp, "lower_last_price": lower_touches[-1].low,
+        "shape": range_result.shape,
+        "upper_tests": range_result.upper_tests, "lower_tests": range_result.lower_tests,
+        "duration_candles": range_result.duration_candles,
+        "width_percent_at_genesis": range_result.width_percent,
+        "compression": range_result.compression,
+        "boundary_touch_sequence": range_result.boundary_touch_sequence,
+        "dominance_ratio": range_result.directional_dominance_ratio,
+        "upper_touch_candles": upper_touches,
+        "lower_touch_candles": lower_touches,
+        "lookback_candles_used": range_result.lookback_candles_used,
+        "upper_slope_per_candle": range_result.upper_slope_per_candle,
+        "lower_slope_per_candle": range_result.lower_slope_per_candle,
+        "last_verified_ts": upper_touches[-1].timestamp if upper_touches[-1].timestamp > lower_touches[-1].timestamp else lower_touches[-1].timestamp,
+        "current_price": range_result.current_price,
+    }
+
+
+def detect_range_with_memory(symbol: str, candles: List[Candle], swings: List[SwingPoint], timeframe: str) -> RangeResult:
+    """
+    Entry point used by run_once — wraps detect_range() with persistence.
+    Checks a previously-confirmed ACTIVE range FIRST; only runs a fresh
+    search when there's no persisted range or it's just been proven
+    broken. A persisted range is validated using only the NEW candles
+    since it was last checked — not re-derived from scratch.
+    """
+    key = (symbol, timeframe)
+    persisted = _persisted_ranges.get(key)
+
+    if persisted is not None:
+        updated = _validate_persisted_range(candles, persisted)
+        if updated is not None:
+            _persisted_ranges[key] = updated
+            return _persisted_to_range_result(updated, timeframe)
+        else:
+            # Proven broken — drop it, fall through to a fresh search.
+            del _persisted_ranges[key]
+
+    fresh_result = detect_range(candles, swings, timeframe)
+
+    if fresh_result.status == "ACTIVE":
+        _persisted_ranges[key] = _snapshot_range_for_persistence(fresh_result)
+
+    return fresh_result
+
+
 def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str) -> RangeResult:
     """
     Phase 2A Range Detection v3 — generalized shapes via line-fitting.
@@ -878,7 +1089,9 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
     candle's own index instead of one fixed number.
     """
     total_candles = len(candles)
-    lookback_start_index = max(0, total_candles - RANGE_LOOKBACK_CANDLES)
+    range_lookback_candles = _range_lookback_candles_for(timeframe)
+    min_range_candles = _min_range_candles_for(timeframe)
+    lookback_start_index = max(0, total_candles - range_lookback_candles)
     lookback_candles_used = total_candles - lookback_start_index
 
     lookback_swings = [s for s in swings if s.index >= lookback_start_index]
@@ -1091,12 +1304,12 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
     contained_end_index = breach_index - 1 if breach_index is not None else present_index
     contained_duration = contained_end_index - genesis_index + 1
 
-    if contained_duration < MIN_RANGE_CANDLES:
+    if contained_duration < min_range_candles:
         return RangeResult(
             detected=False, status="NO_RANGE",
             reason=(
                 f"range too short (contained duration {contained_duration} "
-                f"< {MIN_RANGE_CANDLES} candles)"
+                f"< {min_range_candles} candles for {timeframe})"
             ),
             boundary_touch_sequence=touch_sequence,
             directional_dominance_ratio=dominance_ratio,
@@ -1153,6 +1366,8 @@ def detect_range(candles: List[Candle], swings: List[SwingPoint], timeframe: str
         directional_dominance_ratio=dominance_ratio,
         upper_touch_swings=list(upper_line.touches),
         lower_touch_swings=list(lower_line.touches),
+        upper_touch_candles=[candles[s.index] for s in upper_line.touches],
+        lower_touch_candles=[candles[s.index] for s in lower_line.touches],
         lookback_candles_used=lookback_candles_used,
         shape=shape,
         upper_slope_per_candle=upper_line.slope_per_candle,
@@ -1272,8 +1487,12 @@ def _close_position_in_candle(candle: Candle) -> float:
     return max(0.0, min(1.0, position))
 
 
-def _evaluate_boundary_control(candles: List[Candle], touch_swings: List[SwingPoint], is_upper: bool) -> BoundaryControlResult:
-    positions = [_close_position_in_candle(candles[s.index]) for s in touch_swings]
+def _evaluate_boundary_control(touch_candles: List[Candle], is_upper: bool) -> BoundaryControlResult:
+    """Takes self-contained candle snapshots directly (not index+swing
+    lookups) — works identically whether the touches came from this
+    scan's fresh search or were carried over from a persisted range
+    computed on an earlier scan's (different) candles list."""
+    positions = [_close_position_in_candle(c) for c in touch_candles]
     avg_position = sum(positions) / len(positions)
 
     buyers_winning = avg_position >= BUYER_CONTROL_THRESHOLD
@@ -1297,25 +1516,26 @@ def _evaluate_boundary_control(candles: List[Candle], touch_swings: List[SwingPo
     return BoundaryControlResult(
         verdict=verdict,
         avg_close_position=avg_position,
-        touch_count=len(touch_swings),
+        touch_count=len(touch_candles),
         per_touch_positions=positions,
     )
 
 
-def compute_breakout_readiness(candles: List[Candle], range_result: RangeResult) -> BreakoutReadinessResult:
+def compute_breakout_readiness(range_result: RangeResult) -> BreakoutReadinessResult:
     """
     Only ever computed for an ACTIVE confirmed range (range_result.detected
-    == True, status == "ACTIVE"). Reuses Phase 2A's exact touch swings —
-    no re-fetching, no re-clustering, no new candle data.
+    == True, status == "ACTIVE"). Reads the self-contained touch-candle
+    snapshots on the RangeResult itself — no candles list needed as a
+    separate argument, and no re-fetching/re-clustering.
     """
     if not range_result.detected:
         return BreakoutReadinessResult(applicable=False, reason=f"no active confirmed range (status={range_result.status})")
 
-    if not range_result.upper_touch_swings or not range_result.lower_touch_swings:
+    if not range_result.upper_touch_candles or not range_result.lower_touch_candles:
         return BreakoutReadinessResult(applicable=False, reason="range confirmed but touch data unavailable")
 
-    upper_control = _evaluate_boundary_control(candles, range_result.upper_touch_swings, is_upper=True)
-    lower_control = _evaluate_boundary_control(candles, range_result.lower_touch_swings, is_upper=False)
+    upper_control = _evaluate_boundary_control(range_result.upper_touch_candles, is_upper=True)
+    lower_control = _evaluate_boundary_control(range_result.lower_touch_candles, is_upper=False)
 
     return BreakoutReadinessResult(
         applicable=True,
@@ -1682,12 +1902,12 @@ def run_once(router: DataRouter) -> List[MarketStateResult]:
             # Phase 2A — Range Detection (SSOT2). Reuses SSOT1's own
             # closed candles and confirmed swings; no new fetching, no
             # re-validation, no modification of SSOT1's outputs.
-            range_result = detect_range(ohlcv.candles, swings, timeframe)
+            range_result = detect_range_with_memory(symbol, ohlcv.candles, swings, timeframe)
 
             # Phase 2B — Breakout Readiness. Only meaningful for an
             # already-confirmed range; compute_breakout_readiness itself
             # returns applicable=False otherwise.
-            breakout_readiness = compute_breakout_readiness(ohlcv.candles, range_result)
+            breakout_readiness = compute_breakout_readiness(range_result)
 
             results.append(MarketStateResult(
                 symbol=symbol,
