@@ -66,6 +66,9 @@ PORT = int(os.environ.get("PORT", 10000))
 # Holds the most recent report text so the health server can serve it.
 _latest_report_lock = threading.Lock()
 _latest_report_text = "No report generated yet."
+# Structured results, kept alongside the plain-text report so the card
+# page can render directly from real data without re-parsing text.
+_latest_results: list = []
 
 
 # ============================================================================
@@ -1933,16 +1936,161 @@ def run_once(router: DataRouter) -> List[MarketStateResult]:
     return results
 
 
+def _escape_html(text) -> str:
+    if text is None:
+        return ""
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def build_cards_html(results: List["MarketStateResult"]) -> str:
+    """
+    Card-style view of the SAME data as the plain-text report — no new
+    computation, purely a different presentation of results that already
+    exist. Only renders a card for rows with an ACTIVE confirmed range
+    (per Phase 2A/2B's own rule: Phase 2B is only meaningful for ACTIVE
+    ranges). Deliberately excludes any scoring/margin number — none is
+    computed anywhere in this system, and none is invented here.
+    """
+    cards_html = []
+
+    for r in results:
+        if r.error:
+            continue
+        rr = r.range_result
+        br = r.breakout_readiness
+        if rr is None or not rr.detected or br is None or not br.applicable:
+            continue
+
+        upper_verdict = br.upper.verdict
+        lower_verdict = br.lower.verdict
+
+        def _badge_color(verdict: str) -> str:
+            if "BULLISH" in verdict or "BUYERS" in verdict:
+                return "#1fbf75"  # green
+            if "BEARISH" in verdict or "SELLERS" in verdict:
+                return "#e5484d"  # red
+            return "#8a8f98"  # gray, CONTESTED
+
+        # Whichever boundary current price sits closer to gets top billing,
+        # matching the reference layout's single top badge.
+        pos = rr.current_position_percent if rr.current_position_percent is not None else 50.0
+        near_upper = pos >= 50.0
+        top_verdict = upper_verdict if near_upper else lower_verdict
+        top_label = "RESISTANCE" if near_upper else "SUPPORT"
+        top_color = _badge_color(top_verdict)
+
+        persisted_note = " (persisted)" if rr.from_persisted else ""
+        compression_str = "Yes" if rr.compression is True else ("No" if rr.compression is False else "N/A")
+
+        upper_away_pct = None
+        lower_away_pct = None
+        if rr.current_price and rr.upper_boundary:
+            upper_away_pct = abs(rr.upper_boundary - rr.current_price) / rr.current_price * 100.0
+        if rr.current_price and rr.lower_boundary:
+            lower_away_pct = abs(rr.current_price - rr.lower_boundary) / rr.current_price * 100.0
+
+        card = f"""
+        <div class="card">
+          <div class="card-header">
+            <span class="symbol">{_escape_html(r.symbol)}USDT &middot; {_escape_html(r.timeframe)}</span>
+            <span class="badge" style="background:{top_color}">{_escape_html(top_label)}: {_escape_html(top_verdict)}</span>
+          </div>
+          <div class="price">{rr.current_price:.6g}</div>
+          <div class="levels">
+            <div class="level">
+              <div class="level-label">Resistance</div>
+              <div class="level-value">{rr.upper_boundary:.6g}</div>
+              <div class="level-away">{f"{upper_away_pct:.2f}% away" if upper_away_pct is not None else "-"}</div>
+            </div>
+            <div class="level">
+              <div class="level-label">Support</div>
+              <div class="level-value">{rr.lower_boundary:.6g}</div>
+              <div class="level-away">{f"{lower_away_pct:.2f}% away" if lower_away_pct is not None else "-"}</div>
+            </div>
+          </div>
+          <div class="meta-row">SHAPE: <b>{_escape_html(rr.shape)}</b></div>
+          <div class="meta-row">RANGE STATUS: <b>{_escape_html(rr.status)}{persisted_note}</b> &middot; {rr.duration_time}</div>
+          <div class="verdict-row">
+            <span class="verdict" style="background:{_badge_color(upper_verdict)}">Resistance: {_escape_html(upper_verdict)}</span>
+          </div>
+          <div class="verdict-row">
+            <span class="verdict" style="background:{_badge_color(lower_verdict)}">Support: {_escape_html(lower_verdict)}</span>
+          </div>
+          <div class="evidence">
+            EVIDENCE: {rr.upper_tests} upper tests, {rr.lower_tests} lower tests &middot;
+            Dominance: {rr.directional_dominance_ratio:.2f} &middot; Compression: {compression_str}
+          </div>
+        </div>
+        """
+        cards_html.append(card)
+
+    if not cards_html:
+        body = '<p class="empty">No ACTIVE confirmed ranges right now. This page only shows a card when Phase 2A has confirmed a genuine range AND Phase 2B has evaluated who is winning at each boundary — see the plain-text report at <a href="/">/</a> for full diagnostics on every coin/timeframe.</p>'
+    else:
+        body = "\n".join(cards_html)
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Range Detector — Active Ranges</title>
+<style>
+  body {{ background:#0b0d10; color:#e6e6e6; font-family: -apple-system, sans-serif; margin:0; padding:16px; }}
+  h1 {{ font-size:18px; color:#e6e6e6; }}
+  .note {{ color:#8a8f98; font-size:13px; margin-bottom:16px; }}
+  .note a {{ color:#5b9dff; }}
+  .card {{ background:#14171c; border-radius:12px; padding:16px; margin-bottom:16px; border-left:4px solid #333; }}
+  .card-header {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }}
+  .symbol {{ font-weight:700; font-size:16px; }}
+  .badge, .verdict {{ color:#fff; border-radius:20px; padding:4px 10px; font-size:12px; font-weight:600; }}
+  .price {{ font-size:28px; font-weight:700; margin:8px 0; }}
+  .levels {{ display:flex; gap:12px; margin:12px 0; }}
+  .level {{ background:#1b1f26; border-radius:8px; padding:10px; flex:1; }}
+  .level-label {{ color:#8a8f98; font-size:12px; }}
+  .level-value {{ font-size:16px; font-weight:600; }}
+  .level-away {{ color:#8a8f98; font-size:11px; }}
+  .meta-row {{ font-size:12px; color:#b0b4bb; margin:4px 0; }}
+  .verdict-row {{ margin:6px 0; }}
+  .evidence {{ font-size:11px; color:#8a8f98; margin-top:8px; border-top:1px solid #262a31; padding-top:8px; }}
+  .empty {{ color:#8a8f98; }}
+</style>
+</head>
+<body>
+<h1>Active Ranges — Who's Winning at Support &amp; Resistance</h1>
+<div class="note">Structural read only, not a directional prediction. Full diagnostics for every coin/timeframe: <a href="/">/</a></div>
+{body}
+</body>
+</html>"""
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     """Minimal HTTP server so the platform sees something listening on
-    PORT. GET / (or anything) returns the most recent report as plain
-    text. This has nothing to do with the detection logic itself."""
+    PORT. GET / returns the plain-text report (unchanged — this remains
+    the full, provable diagnostic output for every coin/timeframe).
+    GET /cards returns a card-style HTML view of ACTIVE ranges only,
+    reading the SAME underlying results — no new computation, no
+    alternate detection logic, purely a different presentation."""
 
     def do_GET(self):  # noqa: N802 (stdlib method name)
-        with _latest_report_lock:
-            body = _latest_report_text.encode("utf-8")
+        if self.path.startswith("/cards"):
+            with _latest_report_lock:
+                results_snapshot = list(_latest_results)
+            body = build_cards_html(results_snapshot).encode("utf-8")
+            content_type = "text/html; charset=utf-8"
+        else:
+            with _latest_report_lock:
+                body = _latest_report_text.encode("utf-8")
+            content_type = "text/plain; charset=utf-8"
+
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1960,7 +2108,7 @@ def _start_health_server() -> None:
 
 
 def run_forever() -> None:
-    global _latest_report_text
+    global _latest_report_text, _latest_results
 
     router = DataRouter()
 
@@ -1979,6 +2127,7 @@ def run_forever() -> None:
             report_text = build_report_text(results)
             with _latest_report_lock:
                 _latest_report_text = report_text
+                _latest_results = results
             print(report_text)
         except Exception:
             # A single bad pass should never kill the whole service —
