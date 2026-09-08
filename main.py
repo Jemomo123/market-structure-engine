@@ -1977,6 +1977,24 @@ def build_cards_html(results: List["MarketStateResult"]) -> str:
                 return "#e5484d"  # red
             return "#8a8f98"  # gray, CONTESTED
 
+        def _friendly_tag(verdict: str):
+            """Purely presentational label for an already-computed verdict
+            string — no new logic or data, just a shorter/friendlier
+            phrasing for the tag box, matching the reference layout's
+            'BREAKOUT POTENTIAL' / 'REJECTION POTENTIAL' style tags."""
+            if "IMMINENT" in verdict:
+                return "BREAKOUT POTENTIAL", _badge_color(verdict)
+            if "DEFENDING" in verdict:
+                return "REJECTION POTENTIAL", _badge_color(verdict)
+            return "NO CLEAR WINNER", _badge_color(verdict)
+
+        def _winner_word(verdict: str) -> str:
+            if "BULLISH" in verdict or "BUYERS" in verdict:
+                return "BUYERS"
+            if "BEARISH" in verdict or "SELLERS" in verdict:
+                return "SELLERS"
+            return "NO CLEAR WINNER"
+
         # Whichever boundary current price sits closer to gets top billing,
         # matching the reference layout's single top badge.
         pos = rr.current_position_percent if rr.current_position_percent is not None else 50.0
@@ -1984,6 +2002,7 @@ def build_cards_html(results: List["MarketStateResult"]) -> str:
         top_verdict = upper_verdict if near_upper else lower_verdict
         top_label = "RESISTANCE" if near_upper else "SUPPORT"
         top_color = _badge_color(top_verdict)
+        tag_text, tag_color = _friendly_tag(top_verdict)
 
         persisted_note = " (persisted)" if rr.from_persisted else ""
         compression_str = "Yes" if rr.compression is True else ("No" if rr.compression is False else "N/A")
@@ -2014,6 +2033,9 @@ def build_cards_html(results: List["MarketStateResult"]) -> str:
               <div class="level-away">{f"{lower_away_pct:.2f}% away" if lower_away_pct is not None else "-"}</div>
             </div>
           </div>
+          <div class="active-level">ACTIVE LEVEL: <b>{_escape_html(top_label)}</b></div>
+          <div class="active-level">{_escape_html(r.timeframe)} WINNER: <b style="color:{top_color}">{_escape_html(_winner_word(top_verdict))}</b></div>
+          <div class="tag" style="border-color:{tag_color}; color:{tag_color}">{_escape_html(tag_text)}</div>
           <div class="meta-row">SHAPE: <b>{_escape_html(rr.shape)}</b></div>
           <div class="meta-row">RANGE STATUS: <b>{_escape_html(rr.status)}{persisted_note}</b> &middot; {rr.duration_time}</div>
           <div class="verdict-row">
@@ -2058,6 +2080,8 @@ def build_cards_html(results: List["MarketStateResult"]) -> str:
   .level-away {{ color:#8a8f98; font-size:11px; }}
   .meta-row {{ font-size:12px; color:#b0b4bb; margin:4px 0; }}
   .verdict-row {{ margin:6px 0; }}
+  .active-level {{ font-size:13px; color:#d0d3d8; margin:4px 0; }}
+  .tag {{ display:inline-block; border:1.5px solid; border-radius:6px; padding:4px 12px; font-size:12px; font-weight:700; margin:8px 0; }}
   .evidence {{ font-size:11px; color:#8a8f98; margin-top:8px; border-top:1px solid #262a31; padding-top:8px; }}
   .empty {{ color:#8a8f98; }}
 </style>
